@@ -1037,94 +1037,98 @@ def handle_find_command(args):
     result = AwsFinder(args.resource_id, args.profile, args.region)
     print(result)
 
-def main():
-    parser = argparse.ArgumentParser(prog="awspy", description='Fetch AWS networking information.')
-    parser.add_argument('-r', '--region', help='AWS region', default=None)
-    parser.add_argument('-p', '--profile', help='AWS profile', default=None)
+class Parser:
+    def __init__(self):
+        #build parser
+        self.parser = argparse.ArgumentParser(prog="awspy", description='Fetch AWS networking information.')
+        self.description = 'Fetch AWS networking information'
+        self.parser.add_argument('-r', '--region', help='AWS region', default=None)
+        self.parser.add_argument('-p', '--profile', help='AWS profile', default=None)
 
-    subparsers = parser.add_subparsers(title='Commands', dest='command', metavar="")
+        subparsers = self.parser.add_subparsers(title='Commands', dest='command', metavar="")
 
-    # ENI subparser
-    parser_eni = subparsers.add_parser('eni', help='Fetch ENI information')
-    parser_eni.add_argument('identifier', help='ENI identifier (e.g., IP address, ENI ID)')
-    parser_eni.set_defaults(func=handle_eni_command)
+        # ENI subparser
+        parser_eni = subparsers.add_parser('eni', help='Fetch ENI information')
+        parser_eni.add_argument('identifier', help='ENI identifier (e.g., IP address, ENI ID)')
+        parser_eni.set_defaults(func=handle_eni_command)
 
-    # Subnet subparser
-    parser_subnet = subparsers.add_parser('subnet', help='Fetch Subnet information')
-    parser_subnet.add_argument('identifier', help='Subnet identifier (e.g., CIDR, Subnet ID)')
-    parser_subnet.set_defaults(func=handle_subnet_command)
+        # Subnet subparser
+        parser_subnet = subparsers.add_parser('subnet', help='Fetch Subnet information')
+        parser_subnet.add_argument('identifier', help='Subnet identifier (e.g., CIDR, Subnet ID)')
+        parser_subnet.set_defaults(func=handle_subnet_command)
 
-    # Route Table subparser
-    parser_rt = subparsers.add_parser('rt', help='Fetch Route Table information')
-    parser_rt.add_argument('identifier', help='Route Table ID')
-    parser_rt.add_argument('filter_ip', nargs='?', help='Optional IP/Subnet for route filtering')
-    parser_rt.set_defaults(func=handle_rt_command)
-    
-    # PL (Prefix List) subparser
-    parser_pl = subparsers.add_parser('pl', help='Fetch Prefix List CIDRs')
-    parser_pl.add_argument('prefix_list_id', help='Prefix List ID')
-    parser_pl.set_defaults(func=handle_pl_command)
+        # Route Table subparser
+        parser_rt = subparsers.add_parser('rt', help='Fetch Route Table information')
+        parser_rt.add_argument('identifier', help='Route Table ID')
+        parser_rt.add_argument('filter_ip', nargs='?', help='Optional IP/Subnet for route filtering')
+        parser_rt.set_defaults(func=handle_rt_command)
 
-    # VPC subparser
-    parser_vpc = subparsers.add_parser('vpc', help='Fetch VPC information')
-    parser_vpc.add_argument('vpc_id', help='VPC ID')
-    parser_vpc.set_defaults(func=handle_vpc_command)
+        # PL (Prefix List) subparser
+        parser_pl = subparsers.add_parser('pl', help='Fetch Prefix List CIDRs')
+        parser_pl.add_argument('prefix_list_id', help='Prefix List ID')
+        parser_pl.set_defaults(func=handle_pl_command)
 
-    # SG (Security Group) subparser
-    parser_sg = subparsers.add_parser('sg', help='Fetch Security Group information')
-    parser_sg.add_argument('sg_id', help='Security Group ID')
-    parser_sg.set_defaults(func=handle_sg_command)
+        # VPC subparser
+        parser_vpc = subparsers.add_parser('vpc', help='Fetch VPC information')
+        parser_vpc.add_argument('vpc_id', help='VPC ID')
+        parser_vpc.set_defaults(func=handle_vpc_command)
 
-    # EC2 subparser
-    parser_ec2 = subparsers.add_parser('ec2', help='Fetch EC2 instance information')
-    parser_ec2.add_argument('instance_id', help='EC2 instance ID or Name')
-    parser_ec2.set_defaults(func=handle_ec2_command)
+        # SG (Security Group) subparser
+        parser_sg = subparsers.add_parser('sg', help='Fetch Security Group information')
+        parser_sg.add_argument('sg_id', help='Security Group ID')
+        parser_sg.set_defaults(func=handle_sg_command)
 
-    # ACL (Network ACL) subparser
-    parser_acl = subparsers.add_parser('acl', help='Fetch Network ACL information')
-    parser_acl.add_argument('acl_id', help='Network ACL ID')
-    parser_acl.set_defaults(func=handle_acl_command)
+        # EC2 subparser
+        parser_ec2 = subparsers.add_parser('ec2', help='Fetch EC2 instance information')
+        parser_ec2.add_argument('instance_id', help='EC2 instance ID or Name')
+        parser_ec2.set_defaults(func=handle_ec2_command)
 
+        # ACL (Network ACL) subparser
+        parser_acl = subparsers.add_parser('acl', help='Fetch Network ACL information')
+        parser_acl.add_argument('acl_id', help='Network ACL ID')
+        parser_acl.set_defaults(func=handle_acl_command)
 
-    # TGW subparser
-    parser_tgw = subparsers.add_parser('tgw', help='Fetch Transit Gateway information')
-    parser_tgw.add_argument('tgw_id', help='Transit Gateway ID or Name')
-    parser_tgw.set_defaults(func=handle_tgw_command)
+        # TGW subparser
+        parser_tgw = subparsers.add_parser('tgw', help='Fetch Transit Gateway information')
+        parser_tgw.add_argument('tgw_id', help='Transit Gateway ID or Name')
+        parser_tgw.set_defaults(func=handle_tgw_command)
 
-    # DXGW subparser
-    parser_dxgw = subparsers.add_parser('dxgw', help='Fetch Direct Connect Gateway information')
-    parser_dxgw.add_argument('dxgw_id', help='Direct Connect Gateway ID')
-    parser_dxgw.set_defaults(func=handle_dxgw_command)
+        # DXGW subparser
+        parser_dxgw = subparsers.add_parser('dxgw', help='Fetch Direct Connect Gateway information')
+        parser_dxgw.add_argument('dxgw_id', help='Direct Connect Gateway ID')
+        parser_dxgw.set_defaults(func=handle_dxgw_command)
 
-    # dx-vif subparser
-    parser_dxgw = subparsers.add_parser('vif', help='Fetch Direct Connect Gateway VIF information')
-    parser_dxgw.add_argument('dxvif_id', help='Direct Connect Virtual Interface ID')
-    parser_dxgw.set_defaults(func=handle_dxvif_command)
+        # dx-vif subparser
+        parser_dxgw = subparsers.add_parser('vif', help='Fetch Direct Connect Gateway VIF information')
+        parser_dxgw.add_argument('dxvif_id', help='Direct Connect Virtual Interface ID')
+        parser_dxgw.set_defaults(func=handle_dxvif_command)
 
-    # dx-con subparser
-    parser_dxgw = subparsers.add_parser('con', help='Fetch Direct Connect Gateway Connection information')
-    parser_dxgw.add_argument('dxcon_id', help='Direct Connect Connection ID')
-    parser_dxgw.set_defaults(func=handle_dxcon_command)
+        # dx-con subparser
+        parser_dxgw = subparsers.add_parser('con', help='Fetch Direct Connect Gateway Connection information')
+        parser_dxgw.add_argument('dxcon_id', help='Direct Connect Connection ID')
+        parser_dxgw.set_defaults(func=handle_dxcon_command)
 
-    # Find subparser
-    parser_find = subparsers.add_parser('find', help='Find resource location')
-    parser_find.add_argument('resource_id', help='Resource ID')
-    parser_find.set_defaults(func=handle_find_command)
+        # Find subparser
+        parser_find = subparsers.add_parser('find', help='Find resource location')
+        parser_find.add_argument('resource_id', help='Resource ID')
+        parser_find.set_defaults(func=handle_find_command)
 
-    args = parser.parse_args()
-
-    if args.command:
-        if args.command != 'find':
-            if not args.region or not args.profile:
-                parser.error("Both --region and --profile must be specified for this command.")
-            aws_fetcher = AwsFetcher(args.profile, args.region)
-            if hasattr(args, 'func'):
-                args.func(args, aws_fetcher)
-        elif args.command == 'find':
-            if hasattr(args, 'func'):
-                args.func(args)
-    else:
-        parser.print_help()
+class Entrypoint:
+    def __init__(self, args, parser):
+        if args.command:
+            if args.command != 'find':
+                if not args.region or not args.profile:
+                    parser.error("Both --region and --profile must be specified for this command.")
+                aws_fetcher = AwsFetcher(args.profile, args.region)
+                if hasattr(args, 'func'):
+                    args.func(args, aws_fetcher)
+            elif args.command == 'find':
+                if hasattr(args, 'func'):
+                    args.func(args)
+        else:
+            parser.print_help()
 
 if __name__ == "__main__":
-    main()
+    parser = Parser()
+    args = parser.parser.parse_args()
+    Entrypoint(args,parser.parser)
