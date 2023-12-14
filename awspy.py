@@ -913,7 +913,7 @@ class AwsFetcher:
         return protocol_map.get(str(protocol_code), protocol_code)
 
 def handle_eni_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         eni_info = aws_fetcher.get_eni_information(args.identifier)
@@ -926,7 +926,7 @@ def handle_eni_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_subnet_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         subnet_info = aws_fetcher.get_subnet_information_by_id_or_cidr(args.identifier)
@@ -938,7 +938,7 @@ def handle_subnet_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_rt_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         if args.identifier.startswith("tgw-rtb-"):
@@ -957,7 +957,7 @@ def handle_rt_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_pl_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         cidr_blocks = aws_fetcher.get_managed_prefix_list_entries(args.prefix_list_id)
@@ -972,7 +972,7 @@ def handle_pl_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_vpc_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         vpc_info = aws_fetcher.get_vpc_information(args.vpc_id)
@@ -982,7 +982,7 @@ def handle_vpc_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_sg_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         sg_info = aws_fetcher.get_security_group_information(args.sg_id)
@@ -993,7 +993,7 @@ def handle_sg_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_ec2_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         ec2_info = aws_fetcher.get_instance_information(args.instance_id)
@@ -1003,7 +1003,7 @@ def handle_ec2_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_acl_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         acl_info = aws_fetcher.get_network_acl_information(args.acl_id)
@@ -1015,7 +1015,7 @@ def handle_acl_command(args, aws_fetcher):
 
 
 def handle_tgw_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         tgw_info = aws_fetcher.get_transit_gateway_information(args.tgw_id)
@@ -1025,7 +1025,7 @@ def handle_tgw_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_dxgw_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         dxgw_info = aws_fetcher.get_dxgw_information(args.dxgw_id)
@@ -1036,7 +1036,7 @@ def handle_dxgw_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_dxvif_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         dxvif_info = aws_fetcher.get_dxvif_information(args.dxvif_id)
@@ -1047,7 +1047,7 @@ def handle_dxvif_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_dxcon_command(args, aws_fetcher):
-    current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"{current_time}")
     try:
         dxcon_info = aws_fetcher.get_dxcon_information(args.dxcon_id)
@@ -1138,7 +1138,7 @@ class Parser:
         parser_find.set_defaults(func=handle_find_command)
 
 class Entrypoint:
-    def __init__(self, args, parser):
+    def __init__(self, args, parser, connapp):
         if args.command:
             if args.command != 'find':
                 if not args.region or not args.profile:
@@ -1155,4 +1155,4 @@ class Entrypoint:
 if __name__ == "__main__":
     parser = Parser()
     args = parser.parser.parse_args()
-    Entrypoint(args,parser.parser)
+    Entrypoint(args,parser.parser, None)
