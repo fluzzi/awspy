@@ -312,8 +312,28 @@ class AwsFetcher:
 
             instance_info = instances[0]
             instance_id = instance_info['InstanceId']
+
+            status_checks = {
+                    'instance_status': 'unknown',
+                    'system_status': 'unknown'
+                }
+            try:
+                status = self.ec2_client.describe_instance_status(InstanceIds=[instance_id])
+                instance_status = status['InstanceStatuses'][0]
+                status_checks['instance_status'] = instance_status['InstanceStatus']['Status']
+                status_checks['system_status'] = instance_status['SystemStatus']['Status']
+            except:
+                pass
+
             instance_name = next((tag['Value'] for tag in instance_info['Tags'] if tag['Key'] == 'Name'), 'Unnamed')
+            custodian = next((tag['Value'] for tag in instance_info['Tags'] if tag['Key'] == 'custodian-ignore'), False)
+            state = instance_info['State']["Name"]
             vpc_id = instance_info['VpcId']
+            try:
+                iam_info = instance_info['IamInstanceProfile']
+                iam_role = iam_info['Arn'].split('/')[-1]
+            except:
+                iam_role = None
 
             # Create a list of ENI dictionaries
             enis_list = [{
@@ -334,6 +354,10 @@ class AwsFetcher:
                 'id': instance_id,
                 'name': instance_name,
                 'vpc': vpc_id,
+                'iam': iam_role,
+                'state': state,
+                'status': status_checks,
+                'Keep after shutdown': custodian,
                 'enis': enis_sorted
             }
         except:
@@ -827,22 +851,22 @@ class AwsFetcher:
             # Handling different types of sources (CIDR, security group, etc.)
             sources = []
             for ip_range in rule.get("IpRanges", []):
-                sources.append(ip_range.get("CidrIp", ""))
+                sources.append([ip_range.get("CidrIp", ""), ip_range.get("Description", None)])
             for ipv6_range in rule.get("Ipv6Ranges", []):
-                sources.append(ipv6_range.get("CidrIpv6", ""))
+                sources.append([ipv6_range.get("CidrIpv6", ""), ipv6_range.get("Description", None)])
             for user_id_group_pair in rule.get("UserIdGroupPairs", []):
-                sources.append(user_id_group_pair.get("GroupId", ""))
+                sources.append([user_id_group_pair.get("GroupId", ""), user_id_group_pair.get("Description", None)])
             for prefix_list_id in rule.get("PrefixListIds", []):
-                sources.append(prefix_list_id.get("PrefixListId", ""))
+                sources.append([prefix_list_id.get("PrefixListId", ""), prefix_list_id.get("Description", None)])
     
             # Formatting each rule
             for source in sources:
-                if source.startswith("pl-"):
-                    rule_str = {f"permit {ip_protocol} from: {source} {type} {port_range}": [', '.join(map(str, self.get_managed_prefix_list_entries(source)))]}
-                elif source.startswith("sg-"):
-                    rule_str = {f"permit {ip_protocol} from: {source} {type} {port_range}": [', '.join(map(str, self.get_eni_by_sg(source)))]}
+                if source[0].startswith("pl-"):
+                    rule_str = {f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}": [', '.join(map(str, self.get_managed_prefix_list_entries(source)))]}
+                elif source[0].startswith("sg-"):
+                    rule_str = {f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}": [', '.join(map(str, self.get_eni_by_sg(source[0])))]}
                 else:
-                    rule_str = f"permit {ip_protocol} from: {source} {type} {port_range}"
+                    rule_str = f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}"
                 formatted_rules.append(rule_str)
     
         return formatted_rules
