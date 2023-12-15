@@ -1152,6 +1152,22 @@ class Entrypoint:
         else:
             parser.print_help()
 
+def _connpy_completion(wordsnumber, words):
+    mandatory_options = ["--profile", "--region"]
+    mandatory_options_short = ["--profile", "--region", "-p", "-r"]
+    if wordsnumber == 3:
+        result = ["--profile", "--region", "find", "--help"]
+    elif (wordsnumber == 4 and words[1] in ["-r", "--region"]) or (wordsnumber == 6 and words[3] in ["-r", "--region"]):
+        result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+    elif (wordsnumber == 4 and words[1] in ["-p", "--profile"]) or (wordsnumber == 6 and words[3] in ["-p", "--profile"]):
+        result = boto3.Session().available_profiles
+    elif wordsnumber == 5 and words[1] in mandatory_options_short:
+        result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
+        result.append("find")
+    elif wordsnumber == 7 and words[1] in mandatory_options_short and words[3] in mandatory_options_short:
+        result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "--help"]
+    return result
+
 if __name__ == "__main__":
     parser = Parser()
     args = parser.parser.parse_args()
