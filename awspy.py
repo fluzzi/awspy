@@ -123,6 +123,7 @@ class AwsFetcher:
         self.session = boto3.Session(profile_name=profile, region_name=region)
         self.ec2_client = self.session.client('ec2')
         self.dx_client = self.session.client('directconnect')
+        self.log_client = self.session.client('logs')
 
     def get_instance_name(self, instance_id):
         try:
@@ -142,6 +143,67 @@ class AwsFetcher:
             return None
         except:
             return None
+
+    def get_flow_logs_by_vpc(self, vpc_id):
+        flow_logs_response = self.ec2_client.describe_flow_logs(
+            Filters=[
+                {'Name': 'resource-id', 'Values': [vpc_id]}
+            ]
+        )
+        active_flow_logs = []
+    
+        for flow_log in flow_logs_response['FlowLogs']:
+            if flow_log['LogDestinationType'] == 'cloud-watch-logs' and flow_log['FlowLogStatus'] == 'ACTIVE':
+                active_flow_logs.append(f"{flow_log['FlowLogId']} - {flow_log['LogGroupName']}")
+    
+        return active_flow_logs
+
+    def get_flowlog_information(self, fl_id, eni_id, hours, filter_arg):
+        try:
+            end_time = datetime.datetime.now(datetime.timezone.utc)
+            start_time = end_time - datetime.timedelta(hours=hours)
+            start_timestamp_ms = int(start_time.timestamp() * 1000)
+            end_timestamp_ms = int(end_time.timestamp() * 1000)
+            flow_logs = self.ec2_client.describe_flow_logs(FlowLogIds=[fl_id])
+            log_group_name = flow_logs['FlowLogs'][0]['LogGroupName'] if flow_logs['FlowLogs'] else None
+            streams = self.log_client.describe_log_streams(
+                    logGroupName=log_group_name,
+                    logStreamNamePrefix=eni_id
+                    )
+            log_stream_name = streams['logStreams'][0]['logStreamName'] if streams['logStreams'] else None
+            flowlog = self.log_client.get_log_events(
+                logGroupName=log_group_name,
+                logStreamName=log_stream_name,
+                startFromHead=True,
+                startTime=start_timestamp_ms,
+                endTime=end_timestamp_ms
+            )
+            if filter_arg:
+                events = [event for event in flowlog['events'] if filter_arg in event['message']]
+            else:
+                events = flowlog["events"]
+            formatted_messages = {}
+            for event in events:
+                if 'message' in event and isinstance(event['message'], str):
+                    message = event["message"]
+                    parts = message.split()
+                    event_time = datetime.datetime.fromtimestamp(event["timestamp"]/1000, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    src_ip = parts[3]
+                    dst_ip = parts[4]
+                    src_port = parts[5]
+                    dst_port = parts[6]
+                    protocol_num = parts[7]
+                    start_time = int(parts[10])
+                    action = parts[12]
+                    status = parts[13]
+                    if not event_time in formatted_messages:
+                        formatted_messages[event_time] = []
+                    formatted_message = f"{src_ip} {src_port} -> {dst_ip} {dst_port} - Protocol: {protocol_num} - {action} - {status}"
+                    formatted_messages[event_time].append(formatted_message)
+            return formatted_messages
+
+        except:
+            raise ValueError('No flowlogs found for the given identifiers.')
 
     def get_eni_information(self, eni_identifier):
         if eni_identifier.startswith('eni-'):
@@ -405,6 +467,7 @@ class AwsFetcher:
         subnet_tags = subnet_info.get('Tags', [])
         route_table_id = self.get_route_table_information(subnet_info.get('SubnetId'))
         acl = self.get_acl_by_subnet(subnet_info.get("SubnetId"))
+        flowlogs = self.get_flow_logs_by_vpc(subnet_info.get('VpcId'))
         instance = eni_info.get('Attachment', {}).get('InstanceId', 'Not attached')
         if instance.startswith("i-"):
             instance_name = self.get_instance_name(instance)
@@ -418,7 +481,8 @@ class AwsFetcher:
                 "instance": instance,
                 "ips": [ip['PrivateIpAddress'] for ip in eni_info.get('PrivateIpAddresses', [])] + 
                        [ipv6['Ipv6Address'] for ipv6 in eni_info.get('Ipv6Addresses', [])],
-                "Security Groups": [group['GroupId'] for group in eni_info.get('Groups', [])]
+                "Security Groups": [group['GroupId'] for group in eni_info.get('Groups', [])],
+                "flowlogs": flowlogs
             },
             "subnet": {
                 "ID": subnet_info.get('SubnetId'),
@@ -1057,6 +1121,17 @@ def handle_dxcon_command(args, aws_fetcher):
         print(e)
         sys.exit(1)
 
+def handle_flowlog_command(args, aws_fetcher):
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"{current_time}")
+    try:
+        flowlog_info = aws_fetcher.get_flowlog_information(args.fl_id, args.eni_id, args.hours, args.filter)
+        # formatted_output = aws_fetcher.format_dxcon_output(dxcon_info)
+        print(yaml.dump(flowlog_info, sort_keys=False))
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
 def handle_find_command(args):
     result = AwsFinder(args.resource_id, args.profile, args.region)
     print(result)
@@ -1132,6 +1207,14 @@ class Parser:
         parser_dxgw.add_argument('dxcon_id', help='Direct Connect Connection ID')
         parser_dxgw.set_defaults(func=handle_dxcon_command)
 
+        # flowlog subparser
+        parser_flowlog = subparsers.add_parser('flowlog', help='Fetch Flowlogs for specific ENI')
+        parser_flowlog.add_argument('fl_id', help='FlowLog ID')
+        parser_flowlog.add_argument('eni_id', help='ENI ID')
+        parser_flowlog.set_defaults(func=handle_flowlog_command)
+        parser_flowlog.add_argument('--hours', type=int, default=1, help='Number of hours to capture (default: 1)')
+        parser_flowlog.add_argument('--filter', type=str, default=None, help='Optional filter for flow logs')
+
         # Find subparser
         parser_find = subparsers.add_parser('find', help='Find resource location')
         parser_find.add_argument('resource_id', help='Resource ID')
@@ -1152,7 +1235,7 @@ class Entrypoint:
         else:
             parser.print_help()
 
-def _connpy_completion(wordsnumber, words):
+def _connpy_completion(wordsnumber, words, info = None):
     mandatory_options = ["--profile", "--region"]
     mandatory_options_short = ["--profile", "--region", "-p", "-r"]
     if wordsnumber == 3:
@@ -1165,7 +1248,10 @@ def _connpy_completion(wordsnumber, words):
         result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
         result.append("find")
     elif wordsnumber == 7 and words[1] in mandatory_options_short and words[3] in mandatory_options_short:
-        result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "--help"]
+        result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help"]
+    elif wordsnumber > 7 and words[5] == "flowlog":
+        if not words[-2] in ["--filter", "--hours"]:
+            result = [item for item in ["--filter", "--hours"] if not any(word in item for word in words[:-1])]
     return result
 
 if __name__ == "__main__":
