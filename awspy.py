@@ -8,8 +8,11 @@ import yaml
 import datetime
 import ipaddress
 import re
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
 
-def AwsFinder(resource_id, profiles = None, regions = None):
+
+def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
         if profiles:
             profiles = [profiles]
         else:
@@ -21,11 +24,12 @@ def AwsFinder(resource_id, profiles = None, regions = None):
         # Regular expression for UUID pattern (for DXGW)
         uuid_pattern = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
+        verify = None if verify_ssl else False
         for profile in profiles:
             for region in regions:
                 find_session = boto3.Session(profile_name=profile, region_name=region)
-                find_ec2 = find_session.client('ec2')
-                find_dx = find_session.client('directconnect')
+                find_ec2 = find_session.client('ec2', verify=verify)
+                find_dx = find_session.client('directconnect', verify=verify)
 
                 # Check if resource_id is an IP address or subnet
                 try:
@@ -119,11 +123,12 @@ def AwsFinder(resource_id, profiles = None, regions = None):
         return f"Resource {resource_id} not found"
 
 class AwsFetcher:
-    def __init__(self, profile, region):
+    def __init__(self, profile, region, verify_ssl = True):
+        verify = None if verify_ssl else False
         self.session = boto3.Session(profile_name=profile, region_name=region)
-        self.ec2_client = self.session.client('ec2')
-        self.dx_client = self.session.client('directconnect')
-        self.log_client = self.session.client('logs')
+        self.ec2_client = self.session.client('ec2', verify=verify)
+        self.dx_client = self.session.client('directconnect', verify=verify)
+        self.log_client = self.session.client('logs', verify=verify)
 
     def get_instance_name(self, instance_id):
         try:
@@ -1133,7 +1138,7 @@ def handle_flowlog_command(args, aws_fetcher):
         sys.exit(1)
 
 def handle_find_command(args):
-    result = AwsFinder(args.resource_id, args.profile, args.region)
+    result = AwsFinder(args.resource_id, args.profile, args.region, args.verify_ssl)
     print(result)
 
 class Parser:
@@ -1143,6 +1148,8 @@ class Parser:
         self.description = 'Fetch AWS networking information'
         self.parser.add_argument('-r', '--region', help='AWS region', default=None)
         self.parser.add_argument('-p', '--profile', help='AWS profile', default=None)
+        self.parser.add_argument('--no-verify-ssl', action='store_false', dest='verify_ssl', 
+                                                help='Disable SSL certificate verification')
 
         subparsers = self.parser.add_subparsers(title='Commands', dest='command', metavar="")
 
@@ -1222,11 +1229,13 @@ class Parser:
 
 class Entrypoint:
     def __init__(self, args, parser, connapp):
+        # Suppress only the single InsecureRequestWarning from urllib3 needed
+        warnings.simplefilter('ignore', InsecureRequestWarning)
         if args.command:
             if args.command != 'find':
                 if not args.region or not args.profile:
                     parser.error("Both --region and --profile must be specified for this command.")
-                aws_fetcher = AwsFetcher(args.profile, args.region)
+                aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
                 if hasattr(args, 'func'):
                     args.func(args, aws_fetcher)
             elif args.command == 'find':
@@ -1239,19 +1248,45 @@ def _connpy_completion(wordsnumber, words, info = None):
     mandatory_options = ["--profile", "--region"]
     mandatory_options_short = ["--profile", "--region", "-p", "-r"]
     if wordsnumber == 3:
-        result = ["--profile", "--region", "find", "--help"]
-    elif (wordsnumber == 4 and words[1] in ["-r", "--region"]) or (wordsnumber == 6 and words[3] in ["-r", "--region"]):
-        result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
-    elif (wordsnumber == 4 and words[1] in ["-p", "--profile"]) or (wordsnumber == 6 and words[3] in ["-p", "--profile"]):
-        result = boto3.Session().available_profiles
-    elif wordsnumber == 5 and words[1] in mandatory_options_short:
-        result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-        result.append("find")
-    elif wordsnumber == 7 and words[1] in mandatory_options_short and words[3] in mandatory_options_short:
-        result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help"]
-    elif wordsnumber > 7 and words[5] == "flowlog":
+        result = ["--profile", "--region", "--no-verify-ssl", "find", "--help"]
+    elif wordsnumber == 4:
+        if words[1] == "--no-verify-ssl":
+            result = ["--profile", "--region", "find"]
+        elif words[1] in ["-r", "--region"]:
+            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+        elif words[1] in ["-p", "--profile"]:
+            result = boto3.Session().available_profiles
+    elif wordsnumber == 5:
+        if words[1] in mandatory_options_short:
+            result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
+            result.append("find")
+            result.append("--no-verify-ssl")
+        elif words[2] in ["-r", "--region"]:
+            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+        elif words[2] in ["-p", "--profile"]:
+            result = boto3.Session().available_profiles
+    elif wordsnumber == 6:
+        if words[2] in mandatory_options_short or words[3] == "--no-verify-ssl":
+            result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
+            result.append("find")
+        elif words[3] in ["-r", "--region"]:
+            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+        elif words[3] in ["-p", "--profile"]:
+            result = boto3.Session().available_profiles
+    elif wordsnumber == 7:
+        if words[1] in mandatory_options_short and words[3] in mandatory_options_short:
+            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help", "--no-verify-ssl"]
+        elif words[4] in ["-r", "--region"]:
+            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+        elif words[4] in ["-p", "--profile"]:
+            result = boto3.Session().available_profiles
+    elif wordsnumber > 7 and ( words[5] == "flowlog" or words[6] == "flowlog"):
         if not words[-2] in ["--filter", "--hours"]:
             result = [item for item in ["--filter", "--hours"] if not any(word in item for word in words[:-1])]
+    elif wordsnumber == 8:
+        if "--no-verify-ssl" in words:
+            if (words[1] in mandatory_options_short or words[2] in mandatory_options_short) and (words[3] in mandatory_options_short or words[4] in mandatory_options):
+                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help"]
     return result
 
 if __name__ == "__main__":
