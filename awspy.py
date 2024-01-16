@@ -931,7 +931,7 @@ class AwsFetcher:
             # Formatting each rule
             for source in sources:
                 if source[0].startswith("pl-"):
-                    rule_str = {f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}": [', '.join(map(str, self.get_managed_prefix_list_entries(source)))]}
+                    rule_str = {f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}": [', '.join(map(str, self.get_managed_prefix_list_entries(source[0])))]}
                 elif source[0].startswith("sg-"):
                     rule_str = {f"permit {ip_protocol} from: {source[0]} {type} {port_range} - Desc: {source[1]}": [', '.join(map(str, self.get_eni_by_sg(source[0])))]}
                 else:
