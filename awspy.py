@@ -8,6 +8,7 @@ import yaml
 import datetime
 import ipaddress
 import re
+import os
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -1144,10 +1145,13 @@ def handle_find_command(args):
 class Parser:
     def __init__(self):
         #build parser
+        # Set defaults from environment variables if available
+        default_region = os.getenv('AWS_REGION')
+        default_profile = os.getenv('AWS_PROFILE')
         self.parser = argparse.ArgumentParser(prog="awspy", description='Fetch AWS networking information.')
         self.description = 'Fetch AWS networking information'
-        self.parser.add_argument('-r', '--region', help='AWS region', default=None)
-        self.parser.add_argument('-p', '--profile', help='AWS profile', default=None)
+        self.parser.add_argument('-r', '--region', help='AWS region', default=default_region)
+        self.parser.add_argument('-p', '--profile', help='AWS profile', default=default_profile)
         self.parser.add_argument('--no-verify-ssl', action='store_false', dest='verify_ssl', 
                                                 help='Disable SSL certificate verification')
 
@@ -1232,15 +1236,15 @@ class Entrypoint:
         # Suppress only the single InsecureRequestWarning from urllib3 needed
         warnings.simplefilter('ignore', InsecureRequestWarning)
         if args.command:
-            if args.command != 'find':
+            if args.command == 'find':
+                if hasattr(args, 'func'):
+                    args.func(args)
+            else:
                 if not args.region or not args.profile:
-                    parser.error("Both --region and --profile must be specified for this command.")
+                    parser.error("Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE.")
                 aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
                 if hasattr(args, 'func'):
                     args.func(args, aws_fetcher)
-            elif args.command == 'find':
-                if hasattr(args, 'func'):
-                    args.func(args)
         else:
             parser.print_help()
 
@@ -1248,31 +1252,36 @@ def _connpy_completion(wordsnumber, words, info = None):
     mandatory_options = ["--profile", "--region"]
     mandatory_options_short = ["--profile", "--region", "-p", "-r"]
     if wordsnumber == 3:
-        result = ["--profile", "--region", "--no-verify-ssl", "find", "--help"]
+        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help", "--no-verify-ssl"]
     elif wordsnumber == 4:
         if words[1] == "--no-verify-ssl":
-            result = ["--profile", "--region", "find"]
+            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog"]
         elif words[1] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[1] in ["-p", "--profile"]:
             result = boto3.Session().available_profiles
+        elif words[1] == "flowlog":
+            result = ["--filter", "--hours"]
     elif wordsnumber == 5:
         if words[1] in mandatory_options_short:
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.append("find")
-            result.append("--no-verify-ssl")
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--no-verify-ssl"])
         elif words[2] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[2] in ["-p", "--profile"]:
             result = boto3.Session().available_profiles
+        elif words[2] == "flowlog":
+            result = ["--filter", "--hours"]
     elif wordsnumber == 6:
         if words[2] in mandatory_options_short or words[3] == "--no-verify-ssl":
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.append("find")
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog"])
         elif words[3] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[3] in ["-p", "--profile"]:
             result = boto3.Session().available_profiles
+        elif words[3] == "flowlog" or (words[1] == "flowlog" and words[2] not in ["--filter"]):
+            result = ["--filter", "--hours"]
     elif wordsnumber == 7:
         if words[1] in mandatory_options_short and words[3] in mandatory_options_short:
             result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help", "--no-verify-ssl"]
@@ -1280,7 +1289,9 @@ def _connpy_completion(wordsnumber, words, info = None):
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[4] in ["-p", "--profile"]:
             result = boto3.Session().available_profiles
-    elif wordsnumber > 7 and ( words[5] == "flowlog" or words[6] == "flowlog"):
+        elif words[4] == "flowlog" or (words[2] == "flowlog" and words[3] not in ["--filter"]):
+            result = ["--filter", "--hours"]
+    elif wordsnumber > 7 and ( words[3] == "flowlog" or words[4] == "flowlog" or words[5] == "flowlog" or words[6] == "flowlog"):
         if not words[-2] in ["--filter", "--hours"]:
             result = [item for item in ["--filter", "--hours"] if not any(word in item for word in words[:-1])]
     elif wordsnumber == 8:
