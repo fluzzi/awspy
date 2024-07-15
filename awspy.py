@@ -11,6 +11,8 @@ import re
 import os
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
+from flask import request
+import shlex
 
 
 def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
@@ -982,34 +984,49 @@ class AwsFetcher:
         }
         return protocol_map.get(str(protocol_code), protocol_code)
 
-def handle_eni_command(args, aws_fetcher):
+def handle_eni_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         eni_info = aws_fetcher.get_eni_information(args.identifier)
         subnet_info = aws_fetcher.get_subnet_information(eni_info['SubnetId'])
 
         formatted_output = aws_fetcher.format_eni_output(eni_info, subnet_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_subnet_command(args, aws_fetcher):
+def handle_subnet_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         subnet_info = aws_fetcher.get_subnet_information_by_id_or_cidr(args.identifier)
 
         formatted_output = aws_fetcher.format_subnet_output(subnet_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_rt_command(args, aws_fetcher):
+def handle_rt_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         if args.identifier.startswith("tgw-rtb-"):
             tgw_rt_info = aws_fetcher.get_tgw_route_table_information_by_id(args.identifier)
@@ -1020,127 +1037,203 @@ def handle_rt_command(args, aws_fetcher):
         else:
             route_table_info = aws_fetcher.get_route_table_information_by_id(args.identifier)
             formatted_output = aws_fetcher.format_rt_output(route_table_info, args.filter_ip)
-
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_pl_command(args, aws_fetcher):
+def handle_pl_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         cidr_blocks = aws_fetcher.get_managed_prefix_list_entries(args.prefix_list_id)
         output = {
             "Prefix List ID": args.prefix_list_id,
             "CIDR Blocks": cidr_blocks
         }
-
-        print(yaml.dump(output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(output, sort_keys=False))
+        else:
+            return output
     except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        if stdout:
+            print(f"Error: {e}")
+            sys.exit(1)
+        else:
+            return f"Error: {e}"
 
-def handle_vpc_command(args, aws_fetcher):
+def handle_vpc_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         vpc_info = aws_fetcher.get_vpc_information(args.vpc_id)
-        print(yaml.dump(vpc_info, sort_keys=False))
+        if stdout:
+            print(yaml.dump(vpc_info, sort_keys=False))
+        else:
+            return vpc_info
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_sg_command(args, aws_fetcher):
+def handle_sg_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         sg_info = aws_fetcher.get_security_group_information(args.sg_id)
         formatted_output = aws_fetcher.format_sg_output(sg_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_ec2_command(args, aws_fetcher):
+def handle_ec2_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         ec2_info = aws_fetcher.get_instance_information(args.instance_id)
-        print(yaml.dump(ec2_info, sort_keys=False))
+        if stdout:
+            print(yaml.dump(ec2_info, sort_keys=False))
+        else:
+            return ec2_info
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_acl_command(args, aws_fetcher):
+def handle_acl_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         acl_info = aws_fetcher.get_network_acl_information(args.acl_id)
         formatted_output = aws_fetcher.format_acl_output(acl_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
 
-def handle_tgw_command(args, aws_fetcher):
+def handle_tgw_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         tgw_info = aws_fetcher.get_transit_gateway_information(args.tgw_id)
-        print(yaml.dump(tgw_info, sort_keys=False))
+        if stdout:
+            print(yaml.dump(tgw_info, sort_keys=False))
+        else:
+            return tgw_info
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_dxgw_command(args, aws_fetcher):
+def handle_dxgw_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         dxgw_info = aws_fetcher.get_dxgw_information(args.dxgw_id)
         formatted_output = aws_fetcher.format_dxgw_output(dxgw_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_dxvif_command(args, aws_fetcher):
+def handle_dxvif_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         dxvif_info = aws_fetcher.get_dxvif_information(args.dxvif_id)
         formatted_output = aws_fetcher.format_dxvif_output(dxvif_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_dxcon_command(args, aws_fetcher):
+def handle_dxcon_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         dxcon_info = aws_fetcher.get_dxcon_information(args.dxcon_id)
         formatted_output = aws_fetcher.format_dxcon_output(dxcon_info)
-        print(yaml.dump(formatted_output, sort_keys=False))
+        if stdout:
+            print(yaml.dump(formatted_output, sort_keys=False))
+        else:
+            return formatted_output
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_flowlog_command(args, aws_fetcher):
+def handle_flowlog_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"{current_time}")
+    if stdout:
+	    print(f"{current_time}")
     try:
         flowlog_info = aws_fetcher.get_flowlog_information(args.fl_id, args.eni_id, args.hours, args.filter)
-        # formatted_output = aws_fetcher.format_dxcon_output(dxcon_info)
-        print(yaml.dump(flowlog_info, sort_keys=False))
+        if stdout:
+            print(yaml.dump(flowlog_info, sort_keys=False))
+        else:
+            return flowlog_info
     except Exception as e:
-        print(e)
-        sys.exit(1)
+        if stdout:
+            print(e)
+            sys.exit(1)
+        else:
+            return e
 
-def handle_find_command(args):
+def handle_find_command(args, stdout = True):
     result = AwsFinder(args.resource_id, args.profile, args.region, args.verify_ssl)
-    print(result)
+    if stdout:
+        print(result)
+    else:
+        return result
 
 class Parser:
     def __init__(self):
@@ -1230,6 +1323,63 @@ class Parser:
         parser_find = subparsers.add_parser('find', help='Find resource location')
         parser_find.add_argument('resource_id', help='Resource ID')
         parser_find.set_defaults(func=handle_find_command)
+
+class Preload:
+    def __init__(self, connapp):
+
+        try:
+            @connapp.app.route("/aws_info", methods=["POST"])
+            def aws_info():
+                try:
+                    profiles = boto3.Session().available_profiles
+                    regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+                    parser = Parser()
+                    subparsers_action = next(action for action in parser.parser._actions if isinstance(action, argparse._SubParsersAction))
+                    subparsers = [key for key in subparsers_action.choices.keys()]
+                    return {"regions": regions, "profiles": profiles, "commands": subparsers}
+                except Exception as e:
+                    return {"result": str(e)}
+
+            @connapp.app.route("/aws_command", methods=["POST"])
+            def aws_command():
+                try:
+                    data = request.get_json()
+                    command = data["command"]
+                    fake_args = shlex.split(command)
+                    parser = Parser()
+
+                    # Check for help flags in the main parser
+                    if '-h' in fake_args or '--help' in fake_args:
+                        subparsers_action = next(action for action in parser.parser._actions if isinstance(action, argparse._SubParsersAction))
+                        subparsers = [key for key in subparsers_action.choices.keys()]
+                        for item in subparsers:
+                            if item in fake_args:
+                                help_message = subparsers_action.choices[item].format_help()
+                                break
+                        else:
+                            help_message = parser.parser.format_help()
+                        return {"result": str(help_message)}
+
+                    args = parser.parser.parse_args(fake_args)
+                    warnings.simplefilter('ignore', InsecureRequestWarning)
+
+                    if args.command == 'find':
+                        if hasattr(args, 'func'):
+                            result = args.func(args, stdout=False)
+                            return {"result": str(result)}
+                    else:
+                        if not args.region or not args.profile:
+                            return {"result": "Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE."}
+                        aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
+                        if hasattr(args, 'func'):
+                            result = args.func(args, aws_fetcher, stdout=False)
+                            return result
+
+                except Exception as e:
+                    return {"result": str(e)}
+
+        except:
+            pass
 
 class Entrypoint:
     def __init__(self, args, parser, connapp):
