@@ -13,6 +13,8 @@ import warnings
 from urllib3.exceptions import InsecureRequestWarning
 from flask import request
 import shlex
+import subprocess
+import tempfile
 
 
 def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
@@ -1235,6 +1237,67 @@ def handle_find_command(args, stdout = True):
     else:
         return result
 
+def handle_console_command(args, aws_fetcher, connapp, stdout=False):
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if stdout:
+        print(f"{current_time}")
+    try:
+        # Resolve instance ID
+        instance_info = aws_fetcher.get_instance_information(args.identifier)
+        instance_id = instance_info['id']
+
+        # Prefer ~/.ssh/id_rsa if it exists
+        default_key_path = os.path.expanduser("~/.ssh/id_rsa")
+        if os.path.exists(default_key_path) and os.path.exists(default_key_path + ".pub"):
+            key_path = default_key_path
+            pub_key_path = default_key_path + ".pub"
+        else:
+            # Fallback: generate temporary key
+            key_path = tempfile.NamedTemporaryFile(delete=False).name
+            pub_key_path = key_path + ".pub"
+            subprocess.run(["ssh-keygen", "-t", "rsa", "-b", "2048", "-f", key_path, "-N", ""], check=True)
+            if stdout:
+                print(f"Generated temporary key at {key_path}")
+
+        # Push public key to AWS
+        send_key_cmd = [
+            "aws", "ec2-instance-connect", "send-serial-console-ssh-public-key",
+            "--instance-id", instance_id,
+            "--serial-port", str(args.port),
+            "--ssh-public-key", f"file://{pub_key_path}",
+            "--region", args.region,
+            "--profile", args.profile
+        ]
+        if not args.verify_ssl:
+            send_key_cmd.append("--no-verify-ssl")
+
+        result = subprocess.run(send_key_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("Error sending SSH key:\n", result.stderr)
+            sys.exit(1)
+
+        # Connect to AWS serial console
+        ssh_user = f"{instance_id}.port{args.port}"
+        ssh_host = f"serial-console.ec2-instance-connect.{args.region}.aws"
+        if stdout:
+            print(f"Connecting to EC2 Serial Console on {ssh_host} as {ssh_user}...")
+        if connapp:
+            node = connapp.config._getallnodes("console@aws")
+            device = connapp.config.getitem(node[0])
+            device['host'] = ssh_host
+            device['user'] = ssh_user
+            instance = connapp.node("console", **device ,config=connapp.config)
+            instance.interact()
+        else:
+            subprocess.run(["ssh", "-i", key_path, f"{ssh_user}@{ssh_host}"])
+
+    except Exception as e:
+        if stdout:
+            print(f"Failed to connect to serial console: {e}")
+            sys.exit(1)
+        else:
+            return str(e)
+
 class Parser:
     def __init__(self):
         #build parser
@@ -1324,6 +1387,14 @@ class Parser:
         parser_find.add_argument('resource_id', help='Resource ID')
         parser_find.set_defaults(func=handle_find_command)
 
+        
+        # Console subparser
+        parser_console = subparsers.add_parser('console', help='Connect to EC2 serial console')
+        parser_console.add_argument('identifier', help='Instance ID or Name tag')
+        parser_console.add_argument('--port', type=int, default=0, help='Serial port number (default: 0)')
+        parser_console.add_argument('--user', default='ec2-user', help='SSH username (default: ec2-user)')
+        parser_console.set_defaults(func=handle_console_command)
+
 class Preload:
     def __init__(self, connapp):
 
@@ -1394,7 +1465,10 @@ class Entrypoint:
                     parser.error("Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE.")
                 aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
                 if hasattr(args, 'func'):
-                    args.func(args, aws_fetcher)
+                    if args.command == 'console':
+                        args.func(args, aws_fetcher,connapp)
+                    else:
+                        args.func(args, aws_fetcher)
         else:
             parser.print_help()
 
@@ -1402,10 +1476,10 @@ def _connpy_completion(wordsnumber, words, info = None):
     mandatory_options = ["--profile", "--region"]
     mandatory_options_short = ["--profile", "--region", "-p", "-r"]
     if wordsnumber == 3:
-        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help", "--no-verify-ssl"]
+        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog",  "console", "--help", "--no-verify-ssl"]
     elif wordsnumber == 4:
         if words[1] == "--no-verify-ssl":
-            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog"]
+            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console"]
         elif words[1] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[1] in ["-p", "--profile"]:
@@ -1415,7 +1489,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 5:
         if words[1] in mandatory_options_short:
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--no-verify-ssl"])
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--no-verify-ssl"])
         elif words[2] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[2] in ["-p", "--profile"]:
@@ -1425,7 +1499,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 6:
         if words[2] in mandatory_options_short or words[3] == "--no-verify-ssl":
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog"])
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console"])
         elif words[3] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[3] in ["-p", "--profile"]:
@@ -1434,7 +1508,7 @@ def _connpy_completion(wordsnumber, words, info = None):
             result = ["--filter", "--hours"]
     elif wordsnumber == 7:
         if words[1] in mandatory_options_short and words[3] in mandatory_options_short:
-            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help", "--no-verify-ssl"]
+            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--help", "--no-verify-ssl"]
         elif words[4] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[4] in ["-p", "--profile"]:
@@ -1447,7 +1521,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 8:
         if "--no-verify-ssl" in words:
             if (words[1] in mandatory_options_short or words[2] in mandatory_options_short) and (words[3] in mandatory_options_short or words[4] in mandatory_options):
-                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "--help"]
+                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--help"]
     return result
 
 if __name__ == "__main__":
