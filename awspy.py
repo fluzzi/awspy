@@ -15,6 +15,10 @@ from flask import request
 import shlex
 import subprocess
 import tempfile
+from kubernetes import config as k8s_config, client as k8s_client
+import inquirer
+import plotext as plt
+import time
 
 
 def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
@@ -134,6 +138,8 @@ class AwsFetcher:
         self.ec2_client = self.session.client('ec2', verify=verify)
         self.dx_client = self.session.client('directconnect', verify=verify)
         self.log_client = self.session.client('logs', verify=verify)
+        self.cw_client = self.session.client('cloudwatch', verify=verify)
+        self.asg_client = self.session.client('autoscaling', verify=verify)
 
     def get_instance_name(self, instance_id):
         try:
@@ -475,6 +481,9 @@ class AwsFetcher:
     def format_eni_output(self, eni_info, subnet_info):
 
         subnet_tags = subnet_info.get('Tags', [])
+        eni_tags = eni_info.get('Tags', [])
+        print(subnet_tags)
+        print(eni_tags)
         route_table_id = self.get_route_table_information(subnet_info.get('SubnetId'))
         acl = self.get_acl_by_subnet(subnet_info.get("SubnetId"))
         flowlogs = self.get_flow_logs_by_vpc(subnet_info.get('VpcId'))
@@ -503,6 +512,9 @@ class AwsFetcher:
                 "Vrouter": self.get_tag_value(subnet_tags, 'VrouterName'),
                 "Vrouter-Position": self.get_tag_value(subnet_tags, 'VrouterInterfacePos'),
                 "Vrf": self.get_tag_value(subnet_tags, 'VRFName'),
+                "CTX": self.get_tag_value(subnet_tags, 'CTX'),
+                "CTX-GW": self.get_tag_value(eni_tags, 'CTX-GW'),
+                "CTX-PEER-GROUP": self.get_tag_value(eni_tags, 'CTX-PEER-GROUP'),
                 "acl": acl
             }
         }
@@ -525,6 +537,7 @@ class AwsFetcher:
                 "Vrouter": self.get_tag_value(subnet_tags, 'VrouterName'),
                 "Vrouter-Position": self.get_tag_value(subnet_tags, 'VrouterInterfacePos'),
                 "Vrf": self.get_tag_value(subnet_tags, 'VRFName'),
+                "CTX": self.get_tag_value(subnet_tags, 'CTX'),
                 "acl": acl
             },
             "enis": enis
@@ -986,6 +999,121 @@ class AwsFetcher:
         }
         return protocol_map.get(str(protocol_code), protocol_code)
 
+    def get_all_instances_pps(self):
+        # 1. Map ASGs to Instance IDs using the pre-initialized client
+        asg_to_id = {}
+        try:
+            paginator = self.asg_client.get_paginator('describe_auto_scaling_groups')
+            for page in paginator.paginate():
+                for group in page['AutoScalingGroups']:
+                    if group['Instances']:
+                        asg_to_id[group['AutoScalingGroupName']] = group['Instances'][0]['InstanceId']
+        except: pass
+
+        # 2. Time Window logic (remains the same)
+        end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+        start_time = end_time - datetime.timedelta(minutes=15)
+        period = 300
+
+        # 3. Fetch Metrics using self.cw_client
+        metrics = self.cw_client.list_metrics(Namespace='AWS/EC2', MetricName='NetworkPacketsIn')
+        results = {}
+
+        for m in metrics['Metrics']:
+            raw_dim = m['Dimensions'][0]['Value']
+            resolved_id = asg_to_id.get(raw_dim, raw_dim)
+
+            res = self.cw_client.get_metric_data(
+                MetricDataQueries=[
+                    {'Id': 'i_raw', 'MetricStat': {'Metric': m, 'Period': period, 'Stat': 'Sum'}, 'ReturnData': False},
+                    {'Id': 'o_raw', 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkPacketsOut', 'Dimensions': m['Dimensions']}, 'Period': period, 'Stat': 'Sum'}, 'ReturnData': False},
+                    {'Id': 'in', 'Expression': f'i_raw/{period}', 'ReturnData': True},
+                    {'Id': 'out', 'Expression': f'o_raw/{period}', 'ReturnData': True},
+                    {'Id': 'total', 'Expression': f'(i_raw+o_raw)/{period}', 'ReturnData': True}
+                ],
+                StartTime=start_time, EndTime=end_time
+            )
+            
+            data = {r['Id']: r['Values'][0] if r['Values'] else 0 for r in res['MetricDataResults']}
+            
+            if data.get('total', 0) > 0:
+                # Deduplication logic: keep the entry with highest traffic for the same ID
+                if resolved_id not in results or data['total'] > results[resolved_id]['total']:
+                    results[resolved_id] = {
+                        'id': resolved_id,
+                        'in': data['in'],
+                        'out': data['out'],
+                        'total': data['total'],
+                        'name': self.get_instance_name(resolved_id) if resolved_id.startswith('i-') else raw_dim
+                    }
+        
+        return sorted(results.values(), key=lambda x: x['total'], reverse=True)
+
+    def get_instance_pps(self, instance_id, hours):
+        """Fetches PPS metrics for a specific instance for graphing."""
+        # 1. Setup Time Window (5-min offset for CW consistency)
+        end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+        start_time = end_time - datetime.timedelta(hours=hours)
+        period = 300 
+
+        try:
+            # 2. Fetch Metrics using the centralized CW client
+            response = self.cw_client.get_metric_data(
+                MetricDataQueries=[
+                    {
+                        'Id': 'i', 
+                        'MetricStat': {
+                            'Metric': {
+                                'Namespace': 'AWS/EC2', 
+                                'MetricName': 'NetworkPacketsIn', 
+                                'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                            }, 
+                            'Period': period, 
+                            'Stat': 'Sum'
+                        }, 
+                        'ReturnData': False
+                    },
+                    {
+                        'Id': 'o', 
+                        'MetricStat': {
+                            'Metric': {
+                                'Namespace': 'AWS/EC2', 
+                                'MetricName': 'NetworkPacketsOut', 
+                                'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                            }, 
+                            'Period': period, 
+                            'Stat': 'Sum'
+                        }, 
+                        'ReturnData': False
+                    },
+                    # We use Metric Math to calculate real average PPS over the 300s window
+                    {'Id': 'pps_in', 'Expression': f'i / {period}', 'ReturnData': True},
+                    {'Id': 'pps_out', 'Expression': f'o / {period}', 'ReturnData': True}
+                ],
+                StartTime=start_time,
+                EndTime=end_time,
+                ScanBy='TimestampAscending'
+            )
+            
+            # 3. Format data for plotext
+            results = {
+                'timestamps': [],
+                'in': [],
+                'out': []
+            }
+            
+            # Map results to our dictionary
+            for res in response.get('MetricDataResults', []):
+                if res['Id'] == 'pps_in':
+                    results['timestamps'] = [t.strftime("%H:%M") for t in res['Timestamps']]
+                    results['in'] = res['Values']
+                elif res['Id'] == 'pps_out':
+                    results['out'] = res['Values']
+                    
+            return results
+        except Exception as e:
+            raise ValueError(f"Error fetching PPS data from CloudWatch: {e}")
+
 def handle_eni_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     if stdout:
@@ -1298,6 +1426,271 @@ def handle_console_command(args, aws_fetcher, connapp, stdout=False):
         else:
             return str(e)
 
+def handle_connect_command(args, connapp, stdout=False):
+    ctx = []
+    # <--- CAMBIO 1: La expresión regular ahora acepta un número opcional después de 'p' o 's'.
+    # Esto permite que coincida con 'mi-dc-p', 'mi-dc-s1', 'mi-dc-p2', etc.
+    _ENV_RE = re.compile(r'^([a-zA-Z0-9\-]+)-([sp])(\d*)$', re.IGNORECASE)
+    namespaces = []
+    
+    if connapp:
+        choose = connapp._choose
+    else:
+        # <--- CAMBIO 2: Mejoramos la función 'choose' para que funcione con listas de
+        # strings y también con listas de objetos (como los pods de k8s).
+        # Muestra el nombre al usuario pero devuelve el objeto completo, lo que simplifica el código.
+        def choose(list_items, name, action):
+            if not list_items:
+                return None
+            
+            # Si la lista contiene objetos con 'metadata' (como los pods), usa el nombre para las opciones.
+            if hasattr(list_items[0], 'metadata'):
+                choices = [item.metadata.name for item in list_items]
+            else:
+                choices = list_items
+
+            questions = [inquirer.List(name, message=f"Pick {name} to {action}:", choices=choices, carousel=True)]
+            answer = inquirer.prompt(questions)
+            if answer is None:
+                return None
+            
+            selected_name = answer[name]
+            
+            # Devuelve el objeto completo que corresponde al nombre elegido.
+            if hasattr(list_items[0], 'metadata'):
+                for item in list_items:
+                    if item.metadata.name == selected_name:
+                        return item
+            
+            # Si era una lista de strings, devuelve el string.
+            return selected_name
+
+    try:
+        contexts, current = k8s_config.list_kube_config_contexts()
+        if contexts:
+            for c in contexts:
+                if "name" in c:
+                    ctx.append(c["name"])
+    except Exception as e:
+        if stdout:
+            print(f"Error reading kubeconfig: {e}")
+            sys.exit(1)
+    if not ctx:
+        print(f"No contexts found.")
+        sys.exit(2)
+
+    env_map = {}
+    for name in ctx:
+        m = _ENV_RE.match(name)
+        if not m:
+            continue
+        base, role = m.group(1), m.group(2).lower()
+        # <--- CAMBIO 3: Guardamos los contextos en una lista para cada rol ('p' o 's').
+        # Ahora env_map puede tener: {'mi-dc': {'p': ['mi-dc-p1', 'mi-dc-p2'], 's': ['mi-dc-s1']}}
+        env_map.setdefault(base, {}).setdefault(role, []).append(name)
+
+    # Si no hay contextos que coincidan con el patrón, se usa el flujo original (fallback)
+    if not env_map:
+        chosen_ctx_name = ctx[0]
+        if len(ctx) > 1:
+            chosen_ctx_name = choose(ctx, "context", "connect")
+        if chosen_ctx_name is None:
+            sys.exit(7)
+        
+        ctx = [chosen_ctx_name] # Actualizamos ctx para que el resto del flujo lo use
+        k8s_config.load_kube_config(context=ctx[0])
+        v1 = k8s_client.CoreV1Api()
+        ns_list = v1.list_namespace()
+        for ns in ns_list.items:
+            namespaces.append(ns.metadata.name)
+        
+        filtered_ns = [item for item in namespaces if item.startswith("cs-")]
+        if not filtered_ns:
+            print("No XRD namespaces found.")
+            sys.exit(2)
+        
+        ns_selected = filtered_ns[0]
+        if len(filtered_ns) > 1:
+            ns_selected = choose(filtered_ns, "namespace", "connect")
+        if ns_selected is None:
+            sys.exit(7)
+        
+        pods = v1.list_namespaced_pod(namespace=ns_selected).items
+        if not pods:
+            print(f"No pods found in ns: {ns_selected}, cx: {ctx[0]}")
+            sys.exit(2)
+            
+        chosen_pod = pods[0]
+        if len(pods) > 1:
+            chosen_pod = choose(pods, "pod", "connect")
+        if chosen_pod is None:
+            sys.exit(7)
+        pod_name = chosen_pod.metadata.name # Obtenemos el nombre del objeto pod
+        
+        if connapp:
+            node = connapp.config._getallnodes("connect@aws")
+            device = connapp.config.getitem(node[0])
+            device["options"] = f"--context={ctx[0]} -n {ns_selected}"
+            device["host"] = pod_name
+            if args.local:
+                device["user"] = "@xrd"
+                device["password"] = ["@xrd"]
+            instance = connapp.node(pod_name, **device, config=connapp.config)
+            instance.interact()
+        else:
+            command = f"kubectl --context={ctx[0]} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
+            subprocess.run(shlex.split(command))
+        return
+
+    # --- INICIO DEL NUEVO FLUJO MEJORADO ---
+    
+    env_list = sorted(env_map.keys())
+    chosen_env = env_list[0]
+    if len(env_list) > 1:
+        chosen_env = choose(env_list, "environment", "connect")
+    if chosen_env is None:
+        sys.exit(7)
+
+    # <--- CAMBIO 4: Buscamos namespaces en TODOS los clústeres del entorno elegido.
+    ns_by_context = {}
+    all_ns = set()
+    # Creamos una lista única de todos los contextos (p1, p2, s1...)
+    contexts_to_scan = env_map[chosen_env].get("p", []) + env_map[chosen_env].get("s", [])
+
+    for ctx_name in contexts_to_scan:
+        try:
+            k8s_config.load_kube_config(context=ctx_name)
+            v1 = k8s_client.CoreV1Api()
+            ns_list = v1.list_namespace()
+            # Guardamos los namespaces por cada contexto específico
+            context_namespaces = {ns.metadata.name for ns in ns_list.items}
+            ns_by_context[ctx_name] = context_namespaces
+            all_ns.update(context_namespaces) # Agregamos al conjunto total de namespaces
+        except Exception as e:
+            if stdout:
+                print(f"Warning: Error listing namespaces for {ctx_name}: {e}")
+
+    filtered_ns = [n for n in sorted(all_ns) if n.startswith("cs-")]
+    if not filtered_ns:
+        print(f"No XRD namespaces found across all clusters for environment '{chosen_env}'.")
+        sys.exit(2)
+    
+    ns_selected = filtered_ns[0]
+    if len(filtered_ns) > 1:
+        ns_selected = choose(filtered_ns, "namespace", "connect")
+    if ns_selected is None:
+        sys.exit(7)
+
+    # <--- CAMBIO 5: Determinamos en qué contexto(s) existe el namespace y preguntamos si hay más de uno.
+    # Ya no pensamos en 'roles' (p/s) sino en contextos específicos ('mi-dc-p1', 'mi-dc-s2').
+    present_in_contexts = [ctx for ctx, ns_set in ns_by_context.items() if ns_selected in ns_set]
+    
+    if not present_in_contexts:
+        print(f"Namespace {ns_selected} was not found in any available context for {chosen_env}.")
+        sys.exit(2)
+
+    selected_ctx = present_in_contexts[0]
+    if len(present_in_contexts) > 1:
+        # Si el namespace existe en 'mi-dc-p1' y 'mi-dc-s2', el usuario elige a cuál conectar.
+        selected_ctx = choose(present_in_contexts, "context", f"for namespace {ns_selected}")
+    if selected_ctx is None:
+        sys.exit(7)
+
+    # Cargar contexto final y elegir pod
+    k8s_config.load_kube_config(context=selected_ctx)
+    v1 = k8s_client.CoreV1Api()
+    pods = v1.list_namespaced_pod(namespace=ns_selected).items
+    if not pods:
+        print(f"No pods found in ns: {ns_selected}, cx: {selected_ctx}")
+        sys.exit(2)
+        
+    chosen_pod = pods[0]
+    if len(pods) > 1:
+        chosen_pod = choose(pods, "pod", "connect")
+    if chosen_pod is None:
+        sys.exit(7)
+    pod_name = chosen_pod.metadata.name
+
+    if connapp:
+        node = connapp.config._getallnodes("connect@aws")
+        device = connapp.config.getitem(node[0])
+        device["options"] = f"--context={selected_ctx} -n {ns_selected}"
+        device["host"] = pod_name
+        if getattr(args, "local", False):
+            device["user"] = "@xrd"
+            device["password"] = ["@xrd"]
+        instance = connapp.node(pod_name, **device, config=connapp.config)
+        instance.interact()
+    else:
+        command = f"kubectl --context={selected_ctx} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
+        subprocess.run(shlex.split(command))
+
+def handle_pps_command(args, aws_fetcher, stdout=True):
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    if not args.instance_id:
+        if stdout:
+            print(f"Fetching PPS list... {current_time}")
+        try:
+            pps_list = aws_fetcher.get_all_instances_pps()
+            if stdout:
+                header = f"{'Instance ID':<20} | {'In':<10} | {'Out':<10} | {'Total':<10} | {'Name'}"
+                print("\n" + header)
+                print("-" * 115)
+                for r in pps_list:
+                    print(f"{r['id']:<20} | {r['in']:<10.1f} | {r['out']:<10.1f} | {r['total']:<10.1f} | {r['name']}")
+            else:
+                return pps_list
+        except Exception as e:
+            if stdout:
+                print(f"Error listing PPS: {e}")
+                sys.exit(1)
+            return str(e)
+
+    else:
+        try:
+            instance_info = aws_fetcher.get_instance_information(args.instance_id)
+            target_id = instance_info['id']
+            target_name = instance_info['name']
+            
+            if stdout:
+                print(f"Starting live PPS monitor for {target_name} ({target_id})...")
+                print("Press Ctrl+C to stop.")
+                
+            while True:
+                data = aws_fetcher.get_instance_pps(target_id, args.time)
+                
+                if not data['in']:
+                    print(f"Waiting for CloudWatch cycle... {datetime.datetime.now().strftime('%H:%M:%S')}")
+                else:
+                    x_indices = list(range(len(data['in'])))
+                    
+                    plt.clf()
+                    plt.theme('dark')
+                    plt.plot(x_indices, data['in'], label='PPS In', color='blue')
+                    plt.plot(x_indices, data['out'], label='PPS Out', color='orange')
+                    
+                    # Formatting X Axis
+                    step = max(1, len(data['timestamps']) // 10)
+                    plt.xticks(x_indices[::step], data['timestamps'][::step])
+                    
+                    plt.title(f"PPS Monitor: {target_id} | {target_name}")
+                    plt.ylabel("Packets Per Second")
+                    plt.xlabel("Time (UTC) - Offset 5m")
+                    plt.show()
+                
+                time.sleep(60)
+                
+        except KeyboardInterrupt:
+            if stdout:
+                print("\nMonitoring stopped by user.")
+        except Exception as e:
+            if stdout:
+                print(f"Failed to monitor PPS: {e}")
+                sys.exit(1)
+            else:
+                return str(e)
+
 class Parser:
     def __init__(self):
         #build parser
@@ -1370,7 +1763,7 @@ class Parser:
         parser_dxgw.set_defaults(func=handle_dxvif_command)
 
         # dx-con subparser
-        parser_dxgw = subparsers.add_parser('con', help='Fetch Direct Connect Gateway Connection information')
+        parser_dxgw = subparsers.add_parser('dxcon', help='Fetch Direct Connect Gateway Connection information')
         parser_dxgw.add_argument('dxcon_id', help='Direct Connect Connection ID')
         parser_dxgw.set_defaults(func=handle_dxcon_command)
 
@@ -1386,7 +1779,6 @@ class Parser:
         parser_find = subparsers.add_parser('find', help='Find resource location')
         parser_find.add_argument('resource_id', help='Resource ID')
         parser_find.set_defaults(func=handle_find_command)
-
         
         # Console subparser
         parser_console = subparsers.add_parser('console', help='Connect to EC2 serial console')
@@ -1394,6 +1786,23 @@ class Parser:
         parser_console.add_argument('--port', type=int, default=0, help='Serial port number (default: 0)')
         parser_console.add_argument('--user', default='ec2-user', help='SSH username (default: ec2-user)')
         parser_console.set_defaults(func=handle_console_command)
+
+        # Connect subparser
+        parser_connect = subparsers.add_parser('connect', help='Connect to XRD vrouter')
+        parser_connect.add_argument(
+            "-l", "--local",
+            action="store_true",
+            dest="local",
+            default=False,
+            help=argparse.SUPPRESS
+                )
+        parser_connect.set_defaults(func=handle_connect_command)
+
+        # PPS parser
+        parser_pps = subparsers.add_parser('pps', help='Monitor Packets Per Second (PPS) performance')
+        parser_pps.add_argument('-i', '--instance-id', help='Instance ID or Name Tag to graph (ASCII top mode)')
+        parser_pps.add_argument('-t', '--time', type=int, default=1, help='Hours to look back for the graph')
+        parser_pps.set_defaults(func=handle_pps_command)
 
 class Preload:
     def __init__(self, connapp):
@@ -1460,6 +1869,9 @@ class Entrypoint:
             if args.command == 'find':
                 if hasattr(args, 'func'):
                     args.func(args)
+            elif args.command == 'connect':
+                if hasattr(args, 'func'):
+                    args.func(args ,connapp)
             else:
                 if not args.region or not args.profile:
                     parser.error("Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE.")
@@ -1476,10 +1888,10 @@ def _connpy_completion(wordsnumber, words, info = None):
     mandatory_options = ["--profile", "--region"]
     mandatory_options_short = ["--profile", "--region", "-p", "-r"]
     if wordsnumber == 3:
-        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog",  "console", "--help", "--no-verify-ssl"]
+        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog",  "console", "connect", "--help", "--no-verify-ssl"]
     elif wordsnumber == 4:
         if words[1] == "--no-verify-ssl":
-            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console"]
+            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "connect"]
         elif words[1] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[1] in ["-p", "--profile"]:
@@ -1489,7 +1901,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 5:
         if words[1] in mandatory_options_short:
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--no-verify-ssl"])
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--no-verify-ssl"])
         elif words[2] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[2] in ["-p", "--profile"]:
@@ -1499,7 +1911,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 6:
         if words[2] in mandatory_options_short or words[3] == "--no-verify-ssl":
             result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console"])
+            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console"])
         elif words[3] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[3] in ["-p", "--profile"]:
@@ -1508,7 +1920,7 @@ def _connpy_completion(wordsnumber, words, info = None):
             result = ["--filter", "--hours"]
     elif wordsnumber == 7:
         if words[1] in mandatory_options_short and words[3] in mandatory_options_short:
-            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--help", "--no-verify-ssl"]
+            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--help", "--no-verify-ssl"]
         elif words[4] in ["-r", "--region"]:
             result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
         elif words[4] in ["-p", "--profile"]:
@@ -1521,7 +1933,7 @@ def _connpy_completion(wordsnumber, words, info = None):
     elif wordsnumber == 8:
         if "--no-verify-ssl" in words:
             if (words[1] in mandatory_options_short or words[2] in mandatory_options_short) and (words[3] in mandatory_options_short or words[4] in mandatory_options):
-                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "con", "flowlog", "console", "--help"]
+                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--help"]
     return result
 
 if __name__ == "__main__":
