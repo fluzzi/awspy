@@ -999,6 +999,73 @@ class AwsFetcher:
         }
         return protocol_map.get(str(protocol_code), protocol_code)
 
+    def get_all_instances_bw(self, unit='mbps'):
+        # Mapeo de divisores
+        unit_map = {'bps': 1, 'kbps': 1000, 'mbps': 1000000, 'gbps': 1000000000}
+        divisor = unit_map.get(unit.lower(), 1000000)
+        # 1. Map ASGs to Instance IDs (Igual que en PPS)
+        asg_to_id = {}
+        try:
+            paginator = self.asg_client.get_paginator('describe_auto_scaling_groups')
+            for page in paginator.paginate():
+                for group in page['AutoScalingGroups']:
+                    if group['Instances']:
+                        asg_to_id[group['AutoScalingGroupName']] = group['Instances'][0]['InstanceId']
+        except: pass
+
+        # 2. Time Window logic
+        end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+        start_time = end_time - datetime.timedelta(minutes=15)
+        period = 300
+
+        # 3. Fetch Metrics (NetworkIn en lugar de NetworkPacketsIn)
+        metrics = self.cw_client.list_metrics(Namespace='AWS/EC2', MetricName='NetworkIn')
+        results = {}
+
+        for m in metrics.get('Metrics', []):
+            # 1. Validación de Dimensión (Evita IndexError si la lista está vacía)
+            if not m.get('Dimensions'):
+                continue
+            
+            raw_dim = m['Dimensions'][0]['Value']
+            resolved_id = asg_to_id.get(raw_dim, raw_dim)
+
+            try:
+                res = self.cw_client.get_metric_data(
+                    MetricDataQueries=[
+                        {'Id': 'i_raw', 'MetricStat': {'Metric': m, 'Period': period, 'Stat': 'Sum'}, 'ReturnData': False},
+                        {'Id': 'o_raw', 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkOut', 'Dimensions': m['Dimensions']}, 'Period': period, 'Stat': 'Sum'}, 'ReturnData': False},
+                        {'Id': 'in', 'Expression': f'(i_raw*8)/({period}*{divisor})', 'ReturnData': True},
+                        {'Id': 'out', 'Expression': f'(o_raw*8)/({period}*{divisor})', 'ReturnData': True},
+                        {'Id': 'total', 'Expression': f'((i_raw+o_raw)*8)/({period}*{divisor})', 'ReturnData': True}
+                    ],
+                    StartTime=start_time, EndTime=end_time
+                )
+                
+                # 2. Extracción segura de valores
+                data = {'in': 0.0, 'out': 0.0, 'total': 0.0}
+                for r in res.get('MetricDataResults', []):
+                    # Verificamos que 'Values' exista y tenga al menos un elemento
+                    if r.get('Values') and len(r['Values']) > 0:
+                        data[r['Id']] = r['Values'][0]
+                
+                # 3. Filtrado y Deduplicación
+                total_val = data['total']
+                if total_val > 0:
+                    if resolved_id not in results or total_val > results[resolved_id]['total']:
+                        results[resolved_id] = {
+                            'id': resolved_id,
+                            'in': data['in'],
+                            'out': data['out'],
+                            'total': total_val,
+                            'name': self.get_instance_name(resolved_id) if resolved_id.startswith('i-') else raw_dim
+                        }
+            except Exception as e:
+                # Si falla una métrica específica, saltamos a la siguiente sin romper el script
+                continue
+        
+        return sorted(results.values(), key=lambda x: x['total'], reverse=True)
+
     def get_all_instances_pps(self):
         # 1. Map ASGs to Instance IDs using the pre-initialized client
         asg_to_id = {}
@@ -1048,6 +1115,68 @@ class AwsFetcher:
                     }
         
         return sorted(results.values(), key=lambda x: x['total'], reverse=True)
+
+    def get_instance_bw(self, instance_id, hours, unit='mbps'):
+        # Mapeo de divisores para la fórmula: (Bytes * 8) / (periodo * divisor)
+        unit_map = {
+            'bps': 1,
+            'kbps': 1000,
+            'mbps': 1000000,
+            'gbps': 1000000000
+        }
+        divisor = unit_map.get(unit.lower(), 1000000)
+        end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+        start_time = end_time - datetime.timedelta(hours=hours)
+        period = 300 
+
+        try:
+            response = self.cw_client.get_metric_data(
+                MetricDataQueries=[
+                    {
+                        'Id': 'i', 
+                        'MetricStat': {
+                            'Metric': {
+                                'Namespace': 'AWS/EC2', 
+                                'MetricName': 'NetworkIn', 
+                                'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                            }, 
+                            'Period': period, 'Stat': 'Sum'
+                        }, 
+                        'ReturnData': False
+                    },
+                    {
+                        'Id': 'o', 
+                        'MetricStat': {
+                            'Metric': {
+                                'Namespace': 'AWS/EC2', 
+                                'MetricName': 'NetworkOut', 
+                                'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                            }, 
+                            'Period': period, 'Stat': 'Sum'
+                        }, 
+                        'ReturnData': False
+                    },
+                    # Metric Math para Mbps
+                    {'Id': 'bw_in', 'Expression': f'(i*8)/({period}*{divisor})', 'ReturnData': True},
+                    {'Id': 'bw_out', 'Expression': f'(o*8)/({period}*{divisor})', 'ReturnData': True}
+                ],
+                StartTime=start_time,
+                EndTime=end_time,
+                ScanBy='TimestampAscending'
+            )
+            
+            results = {'timestamps': [], 'in': [], 'out': []}
+            
+            for res in response.get('MetricDataResults', []):
+                if res['Id'] == 'bw_in':
+                    results['timestamps'] = [t.strftime("%H:%M") for t in res['Timestamps']]
+                    results['in'] = res['Values']
+                elif res['Id'] == 'bw_out':
+                    results['out'] = res['Values']
+                    
+            return results
+        except Exception as e:
+            raise ValueError(f"Error fetching BW data from CloudWatch: {e}")
 
     def get_instance_pps(self, instance_id, hours):
         """Fetches PPS metrics for a specific instance for graphing."""
@@ -1113,6 +1242,7 @@ class AwsFetcher:
             return results
         except Exception as e:
             raise ValueError(f"Error fetching PPS data from CloudWatch: {e}")
+
 
 def handle_eni_command(args, aws_fetcher, stdout = True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1625,6 +1755,78 @@ def handle_connect_command(args, connapp, stdout=False):
         command = f"kubectl --context={selected_ctx} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
         subprocess.run(shlex.split(command))
 
+def handle_bw_command(args, aws_fetcher, stdout=True):
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    if not args.instance_id:
+        if stdout:
+            print(f"Fetching Throughput list ({args.unit})... {current_time}")
+        try:
+            # Pasamos la unidad al fetcher para que la lista ya venga calculada
+            bw_list = aws_fetcher.get_all_instances_bw(unit=args.unit)
+            
+            if stdout:
+                # El header ahora inyecta la unidad elegida
+                u = args.unit.upper()
+                header = f"{'Instance ID':<20} | {f'In ({u})':<10} | {f'Out ({u})':<10} | {f'Total ({u})':<10} | {'Name'}"
+                print("\n" + header)
+                print("-" * 125)
+                for r in bw_list:
+                    # Usamos .2f para mantener precisión en KB o MB
+                    print(f"{r['id']:<20} | {r['in']:<10.2f} | {r['out']:<10.2f} | {r['total']:<10.2f} | {r['name']}")
+            else:
+                return bw_list
+        except Exception as e:
+            if stdout:
+                print(f"Error listing Throughput: {e}")
+                sys.exit(1)
+            return str(e)
+
+    else:
+        try:
+            instance_info = aws_fetcher.get_instance_information(args.instance_id)
+            target_id = instance_info['id']
+            target_name = instance_info['name']
+            
+            if stdout:
+                print(f"Starting live BW monitor for {target_name} ({target_id})...")
+                print("Press Ctrl+C to stop.")
+                
+            while True:
+                # El fetcher debería convertir de Bytes a Mbps aquí
+                data = aws_fetcher.get_instance_bw(target_id, args.time, unit=args.unit)
+                
+                if not data['in']:
+                    print(f"Waiting for CloudWatch cycle... {datetime.datetime.now().strftime('%H:%M:%S')}")
+                else:
+                    x_indices = list(range(len(data['in'])))
+                    
+                    plt.clf()
+                    plt.theme('dark')
+                    plt.plot(x_indices, data['in'], label='BW In (Mbps)', color='blue')
+                    plt.plot(x_indices, data['out'], label='BW Out (Mbps)', color='orange')
+                    
+                    # Formatting X Axis
+                    step = max(1, len(data['timestamps']) // 10)
+                    plt.xticks(x_indices[::step], data['timestamps'][::step])
+                    
+                    plt.title(f"Bandwidth Monitor: {target_id} | {target_name}")
+                    plt.ylabel(f"Throughput ({args.unit})")
+                    plt.xlabel("Time (UTC) - Offset 5m")
+                    plt.show()
+                
+                time.sleep(60)
+                
+        except KeyboardInterrupt:
+            if stdout:
+                print("\nMonitoring stopped by user.")
+        except Exception as e:
+            if stdout:
+                print(f"Failed to monitor BW: {e}")
+                sys.exit(1)
+            else:
+                return str(e)
+
 def handle_pps_command(args, aws_fetcher, stdout=True):
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     
@@ -1803,6 +2005,14 @@ class Parser:
         parser_pps.add_argument('-i', '--instance-id', help='Instance ID or Name Tag to graph (ASCII top mode)')
         parser_pps.add_argument('-t', '--time', type=int, default=1, help='Hours to look back for the graph')
         parser_pps.set_defaults(func=handle_pps_command)
+
+        # Throughput (Bandwidth) parser
+        parser_bw = subparsers.add_parser('bw', aliases=['throughput'], help='Monitor Throughput/Bandwidth performance')
+        parser_bw.add_argument('-i', '--instance-id', help='Instance ID or Name Tag to graph (ASCII top mode)')
+        parser_bw.add_argument('-t', '--time', type=int, default=1, help='Hours to look back for the graph')
+        # Puedes agregar una unidad opcional si tus scripts lo soportan (bps, kbps, mbps)
+        parser_bw.add_argument('-u', '--unit', choices=['bps', 'kbps', 'mbps', 'gbps'], default='mbps', help='Unit for the graph (default: mbps)')
+        parser_bw.set_defaults(func=handle_bw_command)
 
 class Preload:
     def __init__(self, connapp):
