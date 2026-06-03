@@ -1,27 +1,54 @@
 #!/usr/bin/python3
 
 import argparse
-import boto3
-from botocore.exceptions import BotoCoreError
 import sys
-import yaml
 import datetime
 import ipaddress
 import re
 import os
 import warnings
-from urllib3.exceptions import InsecureRequestWarning
-from flask import request
 import shlex
 import subprocess
 import tempfile
-from kubernetes import config as k8s_config, client as k8s_client
-import inquirer
-import plotext as plt
 import time
 
+# Lazy loaded libraries
+
+def _lazy_init_aws():
+    global boto3, BotoCoreError, InsecureRequestWarning
+    if "boto3" not in globals():
+        import boto3
+        from botocore.exceptions import BotoCoreError
+        from urllib3.exceptions import InsecureRequestWarning
+
+def _lazy_init_yaml():
+    global yaml
+    if "yaml" not in globals():
+        import yaml
+
+def _yaml_dump(*args, **kwargs):
+    _lazy_init_yaml()
+    return yaml.dump(*args, width=1000, **kwargs)
+
+def _lazy_init_k8s():
+    global k8s_config, k8s_client, inquirer
+    if "k8s_config" not in globals():
+        from kubernetes import config as k8s_config, client as k8s_client
+        import inquirer
+
+def _lazy_init_plot():
+    global plt
+    if "plt" not in globals():
+        import plotext as plt
+
+def _lazy_init_flask():
+    global request
+    if "request" not in globals():
+        from flask import request
 
 def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
+        _lazy_init_aws()
+        resource_id = resource_id.lower()
         if profiles:
             profiles = [profiles]
         else:
@@ -36,9 +63,13 @@ def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
         verify = None if verify_ssl else False
         for profile in profiles:
             for region in regions:
-                find_session = boto3.Session(profile_name=profile, region_name=region)
-                find_ec2 = find_session.client('ec2', verify=verify)
-                find_dx = find_session.client('directconnect', verify=verify)
+                try:
+                    find_session = boto3.Session(profile_name=profile, region_name=region)
+                    find_ec2 = find_session.client('ec2', verify=verify)
+                    find_dx = find_session.client('directconnect', verify=verify)
+                except Exception:
+                    # Skip profiles/regions with access issues (SSO expired, etc.)
+                    continue
 
                 # Check if resource_id is an IP address or subnet
                 try:
@@ -60,8 +91,8 @@ def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
                 except ValueError:
                     # Not a valid subnet, continue with other resource checks
                     pass
-                except BotoCoreError:
-                    # Error in describe_subnets, continue to next region
+                except Exception:
+                    # Error in AWS call, continue to next profile/region
                     continue
 
 
@@ -83,8 +114,8 @@ def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
                 except ValueError:
                     # Not a valid subnet, continue with other resource checks
                     pass
-                except BotoCoreError:
-                    # Error in describe_subnets, continue to next region
+                except Exception:
+                    # Error in AWS call, continue to next profile/region
                     continue
 
                 try:
@@ -133,6 +164,7 @@ def AwsFinder(resource_id, profiles = None, regions = None, verify_ssl = True):
 
 class AwsFetcher:
     def __init__(self, profile, region, verify_ssl = True):
+        _lazy_init_aws()
         verify = None if verify_ssl else False
         self.session = boto3.Session(profile_name=profile, region_name=region)
         self.ec2_client = self.session.client('ec2', verify=verify)
@@ -140,6 +172,173 @@ class AwsFetcher:
         self.log_client = self.session.client('logs', verify=verify)
         self.cw_client = self.session.client('cloudwatch', verify=verify)
         self.asg_client = self.session.client('autoscaling', verify=verify)
+
+    def get_full_inventory(self):
+        """Extracts a comprehensive inventory of AWS resources for the region."""
+        inventory = {
+            "vpcs": [],
+            "subnets": [],
+            "instances": [],
+            "enis": [],
+            "tgws": [],
+            "tgw_rtbs": [],
+            "dxgws": [],
+            "dx_conns": [],
+            "vifs": [],
+            "route_tables": []
+        }
+        try:
+            # 1. VPCs
+            vpcs_resp = self.ec2_client.describe_vpcs()
+            for vpc in vpcs_resp.get('Vpcs', []):
+                name = self.get_tag_value(vpc.get('Tags', []), 'Name') or 'Unnamed'
+                ipv6_cidr = None
+                if vpc.get('Ipv6CidrBlockAssociationSet'):
+                    ipv6_cidr = vpc['Ipv6CidrBlockAssociationSet'][0].get('Ipv6CidrBlock')
+                
+                inventory["vpcs"].append({
+                    "id": vpc['VpcId'],
+                    "name": name,
+                    "cidr": vpc.get('CidrBlock'),
+                    "ipv6_cidr": ipv6_cidr,
+                    "state": vpc.get('State')
+                })
+
+            # 2. Subnets
+            subnets_resp = self.ec2_client.describe_subnets()
+            for subnet in subnets_resp.get('Subnets', []):
+                name = self.get_tag_value(subnet.get('Tags', []), 'Name') or 'Unnamed'
+                ipv6_cidr = None
+                if subnet.get('Ipv6CidrBlockAssociationSet'):
+                    ipv6_cidr = subnet['Ipv6CidrBlockAssociationSet'][0].get('Ipv6CidrBlock')
+                
+                inventory["subnets"].append({
+                    "id": subnet['SubnetId'],
+                    "name": name,
+                    "vpc_id": subnet['VpcId'],
+                    "cidr": subnet.get('CidrBlock'),
+                    "ipv6_cidr": ipv6_cidr,
+                    "az": subnet.get('AvailabilityZone')
+                })
+
+            # 3. Instances
+            instances_resp = self.ec2_client.describe_instances()
+            for res in instances_resp.get('Reservations', []):
+                for inst in res.get('Instances', []):
+                    name = self.get_tag_value(inst.get('Tags', []), 'Name') or 'Unnamed'
+                    ips = [inst.get('PrivateIpAddress')] if inst.get('PrivateIpAddress') else []
+                    ipv6_ips = [addr.get('Ipv6Address') for addr in inst.get('Ipv6Addresses', [])]
+                    ips.extend(ipv6_ips)
+                    
+                    inventory["instances"].append({
+                        "id": inst['InstanceId'],
+                        "name": name,
+                        "vpc_id": inst.get('VpcId'),
+                        "subnet_id": inst.get('SubnetId'),
+                        "state": inst.get('State', {}).get('Name'),
+                        "type": inst.get('InstanceType'),
+                        "ips": ips
+                    })
+
+            # 4. ENIs
+            enis_resp = self.ec2_client.describe_network_interfaces()
+            # Fetch all flow logs to match with ENIs
+            try:
+                flow_logs_resp = self.ec2_client.describe_flow_logs()
+                eni_flow_logs = {fl['ResourceId']: fl for fl in flow_logs_resp.get('FlowLogs', []) if fl['ResourceId'].startswith('eni-')}
+            except:
+                eni_flow_logs = {}
+
+            for eni in enis_resp.get('NetworkInterfaces', []):
+                name = self.get_tag_value(eni.get('Tags', []), 'Name') or 'Unnamed'
+                ips = [ip['PrivateIpAddress'] for ip in eni.get('PrivateIpAddresses', [])]
+                ipv6_ips = [addr.get('Ipv6Address') for addr in eni.get('Ipv6Addresses', [])]
+                ips.extend(ipv6_ips)
+                
+                eni_id = eni['NetworkInterfaceId']
+                flow_log = eni_flow_logs.get(eni_id)
+                inventory["enis"].append({
+                    "id": eni_id,
+                    "name": name,
+                    "vpc_id": eni.get('VpcId'),
+                    "subnet_id": eni.get('SubnetId'),
+                    "status": eni.get('Status'),
+                    "ips": ips,
+                    "description": eni.get('Description'),
+                    "flow_log_status": flow_log['FlowLogStatus'] if flow_log else 'INACTIVE',
+                    "flow_log_id": flow_log['FlowLogId'] if flow_log else None
+                })
+
+            # 5. TGWs
+            tgws_resp = self.ec2_client.describe_transit_gateways()
+            for tgw in tgws_resp.get('TransitGateways', []):
+                name = self.get_tag_value(tgw.get('Tags', []), 'Name') or 'Unnamed'
+                inventory["tgws"].append({
+                    "id": tgw['TransitGatewayId'],
+                    "name": name,
+                    "state": tgw.get('State')
+                })
+
+            # 5b. TGW Route Tables
+            try:
+                tgw_rtbs_resp = self.ec2_client.describe_transit_gateway_route_tables()
+                for rtb in tgw_rtbs_resp.get('TransitGatewayRouteTables', []):
+                    name = self.get_tag_value(rtb.get('Tags', []), 'Name') or 'Unnamed'
+                    inventory["tgw_rtbs"].append({
+                        "id": rtb['TransitGatewayRouteTableId'],
+                        "name": name,
+                        "tgw_id": rtb['TransitGatewayId'],
+                        "state": rtb.get('State')
+                    })
+            except:
+                pass
+
+            # 5c. Route Tables
+            rtbs_resp = self.ec2_client.describe_route_tables()
+            for rtb in rtbs_resp.get('RouteTables', []):
+                name = self.get_tag_value(rtb.get('Tags', []), 'Name') or 'Unnamed'
+                inventory["route_tables"].append({
+                    "id": rtb['RouteTableId'],
+                    "name": name,
+                    "vpc_id": rtb.get('VpcId')
+                })
+
+            # 6. DXGWs
+            try:
+                dxgws_resp = self.dx_client.describe_direct_connect_gateways()
+                for dxgw in dxgws_resp.get('directConnectGateways', []):
+                    inventory["dxgws"].append({
+                        "id": dxgw['directConnectGatewayId'],
+                        "name": dxgw.get('directConnectGatewayName'),
+                        "state": dxgw.get('directConnectGatewayState')
+                    })
+                
+                # 6b. DX Connections
+                dx_conns_resp = self.dx_client.describe_connections()
+                for conn in dx_conns_resp.get('connections', []):
+                    inventory["dx_conns"].append({
+                        "id": conn['connectionId'],
+                        "name": conn.get('connectionName'),
+                        "state": conn.get('connectionState'),
+                        "location": conn.get('location')
+                    })
+
+                # 6c. VIFs
+                vifs_resp = self.dx_client.describe_virtual_interfaces()
+                for vif in vifs_resp.get('virtualInterfaces', []):
+                    inventory["vifs"].append({
+                        "id": vif['virtualInterfaceId'],
+                        "name": vif.get('virtualInterfaceName'),
+                        "state": vif.get('virtualInterfaceState'),
+                        "type": vif.get('virtualInterfaceType')
+                    })
+            except Exception:
+                pass # May not have permissions or DX used
+
+        except Exception as e:
+            inventory["error"] = str(e)
+
+        return inventory
 
     def get_instance_name(self, instance_id):
         try:
@@ -174,12 +373,8 @@ class AwsFetcher:
     
         return active_flow_logs
 
-    def get_flowlog_information(self, fl_id, eni_id, hours, filter_arg):
+    def get_flowlog_information(self, fl_id, eni_id, hours, filter_arg, next_token=None):
         try:
-            end_time = datetime.datetime.now(datetime.timezone.utc)
-            start_time = end_time - datetime.timedelta(hours=hours)
-            start_timestamp_ms = int(start_time.timestamp() * 1000)
-            end_timestamp_ms = int(end_time.timestamp() * 1000)
             flow_logs = self.ec2_client.describe_flow_logs(FlowLogIds=[fl_id])
             log_group_name = flow_logs['FlowLogs'][0]['LogGroupName'] if flow_logs['FlowLogs'] else None
             streams = self.log_client.describe_log_streams(
@@ -187,17 +382,28 @@ class AwsFetcher:
                     logStreamNamePrefix=eni_id
                     )
             log_stream_name = streams['logStreams'][0]['logStreamName'] if streams['logStreams'] else None
-            flowlog = self.log_client.get_log_events(
-                logGroupName=log_group_name,
-                logStreamName=log_stream_name,
-                startFromHead=True,
-                startTime=start_timestamp_ms,
-                endTime=end_timestamp_ms
-            )
+            
+            params = {
+                'logGroupName': log_group_name,
+                'logStreamName': log_stream_name,
+                'startFromHead': True
+            }
+            if next_token:
+                params['nextToken'] = next_token
+            else:
+                end_time = datetime.datetime.now(datetime.timezone.utc)
+                start_time = end_time - datetime.timedelta(hours=hours)
+                params['startTime'] = int(start_time.timestamp() * 1000)
+                params['endTime'] = int(end_time.timestamp() * 1000)
+
+            flowlog = self.log_client.get_log_events(**params)
+            
             if filter_arg:
-                events = [event for event in flowlog['events'] if filter_arg in event['message']]
+                lower_filter = str(filter_arg).lower()
+                events = [event for event in flowlog['events'] if lower_filter in str(event.get('message', '')).lower()]
             else:
                 events = flowlog["events"]
+                
             formatted_messages = {}
             for event in events:
                 if 'message' in event and isinstance(event['message'], str):
@@ -209,14 +415,15 @@ class AwsFetcher:
                     src_port = parts[5]
                     dst_port = parts[6]
                     protocol_num = parts[7]
-                    start_time = int(parts[10])
                     action = parts[12]
                     status = parts[13]
                     if not event_time in formatted_messages:
                         formatted_messages[event_time] = []
                     formatted_message = f"{src_ip} {src_port} -> {dst_ip} {dst_port} - Protocol: {protocol_num} - {action} - {status}"
                     formatted_messages[event_time].append(formatted_message)
-            return formatted_messages
+                    
+            # Return tuple to support pagination/streaming
+            return formatted_messages, flowlog.get('nextForwardToken')
 
         except:
             raise ValueError('No flowlogs found for the given identifiers.')
@@ -260,24 +467,49 @@ class AwsFetcher:
         if not vpc_info:
             raise ValueError("No VPC found for the given ID.")
 
-        # Fetch Transit Gateway attachments for the VPC
-        tgw_attachments_response = self.ec2_client.describe_transit_gateway_attachments(Filters=[{'Name': 'resource-id', 'Values': [vpc_id]}])
-        tgw_attachments = tgw_attachments_response.get('TransitGatewayAttachments', [])
+        # Fetch Transit Gateway VPC attachments to get subnets
+        tgw_vpc_attach_resp = self.ec2_client.describe_transit_gateway_vpc_attachments(
+            Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}, {'Name': 'state', 'Values': ['available']}]
+        )
+        tgw_vpc_attachments = tgw_vpc_attach_resp.get('TransitGatewayVpcAttachments', [])
 
         tgw_associations = []
-        for attachment in tgw_attachments:
-            if 'Association' in attachment and 'TransitGatewayRouteTableId' in attachment['Association']:
-                tgw_associations.append({
-                    'tgw': attachment['TransitGatewayId'],
-                    'tgw-route-table': attachment['Association']['TransitGatewayRouteTableId']
+        for vpc_attach in tgw_vpc_attachments:
+            tgw_id = vpc_attach['TransitGatewayId']
+            
+            # Get TGW route table association for this attachment
+            # We need to find the association in the TGW itself
+            tgw_attach_id = vpc_attach['TransitGatewayAttachmentId']
+            attach_info = self.ec2_client.describe_transit_gateway_attachments(
+                TransitGatewayAttachmentIds=[tgw_attach_id]
+            ).get('TransitGatewayAttachments', [{}])[0]
+            
+            rt_id = "unknown"
+            if 'Association' in attach_info:
+                rt_id = attach_info['Association'].get('TransitGatewayRouteTableId', 'unknown')
+
+            # Get detailed info for each subnet in the attachment
+            subnets_with_rt = []
+            for s_id in vpc_attach.get('SubnetIds', []):
+                rt_info = self.get_route_table_information(s_id)
+                subnets_with_rt.append({
+                    'id': s_id,
+                    'route-table': rt_info or "not-found"
                 })
+
+            tgw_associations.append({
+                'tgw': tgw_id,
+                'tgw-route-table': rt_id,
+                'attachment-id': tgw_attach_id,
+                'attachment-subnets': subnets_with_rt
+            })
 
         return {
             'vpc': {
                 'id': vpc_info.get('VpcId'),
                 'cidr-blocks': [assoc['CidrBlock'] for assoc in vpc_info.get('CidrBlockAssociationSet', []) if assoc.get('CidrBlock')],
                 'ipv6-cidr-blocks': [assoc['Ipv6CidrBlock'] for assoc in vpc_info.get('Ipv6CidrBlockAssociationSet', []) if assoc.get('Ipv6CidrBlock')],
-            'TGW-associations': tgw_associations
+                'TGW-associations': tgw_associations
             },
         }
 
@@ -482,8 +714,6 @@ class AwsFetcher:
 
         subnet_tags = subnet_info.get('Tags', [])
         eni_tags = eni_info.get('Tags', [])
-        print(subnet_tags)
-        print(eni_tags)
         route_table_id = self.get_route_table_information(subnet_info.get('SubnetId'))
         acl = self.get_acl_by_subnet(subnet_info.get("SubnetId"))
         flowlogs = self.get_flow_logs_by_vpc(subnet_info.get('VpcId'))
@@ -794,6 +1024,8 @@ class AwsFetcher:
         return dxgw_info
 
     def format_rt_output(self, rt_info, filter_ip):
+        if filter_ip == "all":
+            filter_ip = None
         routes = rt_info.get('Routes', [])
         most_specific_route = None
         most_specific_length = -1  # Initial value for comparison
@@ -882,6 +1114,8 @@ class AwsFetcher:
         return formatted_route
 
     def format_tgw_rt_output(self, tgw_rt_info, filter_ip=None):
+        if filter_ip == "all":
+            filter_ip = None
         routes = tgw_rt_info
         most_specific_route = None
         most_specific_length = -1  # Initial value for comparison
@@ -913,6 +1147,46 @@ class AwsFetcher:
         elif most_specific_route:
             output["tgw_routes"] = [self.format_tgw_route(most_specific_route)]
 
+        return output
+
+    def format_lgw_route(self, route):
+        # Determine next hop
+        nexthop = route.get('LocalGatewayVirtualInterfaceGroupId') or \
+                  route.get('NetworkInterfaceId') or \
+                  'local'
+        
+        destination = route.get('DestinationCidrBlock') or 'unknown'
+        route_type = 's' # LGW routes are usually static or from VIF group
+        
+        formatted_route = {f"({route_type}) {destination} via {nexthop}": [route.get('State', 'active')]}
+        return formatted_route
+
+    def format_lgw_rt_output(self, lgw_rt_info, filter_ip=None):
+        if filter_ip == "all":
+            filter_ip = None
+        routes = lgw_rt_info
+        most_specific_route = None
+        most_specific_length = -1
+
+        for route in routes:
+            destination = route.get('DestinationCidrBlock', '')
+            try:
+                destination_network = ipaddress.ip_network(destination, strict=False)
+                if filter_ip:
+                    filter_network = ipaddress.ip_network(filter_ip, strict=False)
+                    if filter_network.version == destination_network.version:
+                        if filter_network.subnet_of(destination_network):
+                            if destination_network.prefixlen > most_specific_length:
+                                most_specific_length = destination_network.prefixlen
+                                most_specific_route = route
+            except ValueError:
+                continue
+
+        output = {"lgw_routes": []}
+        if not filter_ip:
+            output["lgw_routes"] = [self.format_lgw_route(route) for route in routes]
+        elif most_specific_route:
+            output["lgw_routes"] = [self.format_lgw_route(most_specific_route)]
         return output
 
     def format_sg_output(self, sg_info):
@@ -1000,10 +1274,10 @@ class AwsFetcher:
         return protocol_map.get(str(protocol_code), protocol_code)
 
     def get_all_instances_bw(self, unit='mbps'):
-        # Mapeo de divisores
+        # Divisor mapping
         unit_map = {'bps': 1, 'kbps': 1000, 'mbps': 1000000, 'gbps': 1000000000}
         divisor = unit_map.get(unit.lower(), 1000000)
-        # 1. Map ASGs to Instance IDs (Igual que en PPS)
+        # 1. Map ASGs to Instance IDs (Same as in PPS)
         asg_to_id = {}
         try:
             paginator = self.asg_client.get_paginator('describe_auto_scaling_groups')
@@ -1018,12 +1292,12 @@ class AwsFetcher:
         start_time = end_time - datetime.timedelta(minutes=15)
         period = 300
 
-        # 3. Fetch Metrics (NetworkIn en lugar de NetworkPacketsIn)
+        # 3. Fetch Metrics (NetworkIn instead of NetworkPacketsIn)
         metrics = self.cw_client.list_metrics(Namespace='AWS/EC2', MetricName='NetworkIn')
         results = {}
 
         for m in metrics.get('Metrics', []):
-            # 1. Validación de Dimensión (Evita IndexError si la lista está vacía)
+            # 1. Dimension Validation (Prevents IndexError if the list is empty)
             if not m.get('Dimensions'):
                 continue
             
@@ -1042,14 +1316,14 @@ class AwsFetcher:
                     StartTime=start_time, EndTime=end_time
                 )
                 
-                # 2. Extracción segura de valores
+                # 2. Safe value extraction
                 data = {'in': 0.0, 'out': 0.0, 'total': 0.0}
                 for r in res.get('MetricDataResults', []):
-                    # Verificamos que 'Values' exista y tenga al menos un elemento
+                    # We verify that 'Values' exists and has at least one element
                     if r.get('Values') and len(r['Values']) > 0:
                         data[r['Id']] = r['Values'][0]
                 
-                # 3. Filtrado y Deduplicación
+                # 3. Filtering and Deduplication
                 total_val = data['total']
                 if total_val > 0:
                     if resolved_id not in results or total_val > results[resolved_id]['total']:
@@ -1061,7 +1335,7 @@ class AwsFetcher:
                             'name': self.get_instance_name(resolved_id) if resolved_id.startswith('i-') else raw_dim
                         }
             except Exception as e:
-                # Si falla una métrica específica, saltamos a la siguiente sin romper el script
+                # If a specific metric fails, skip to the next one without breaking the script
                 continue
         
         return sorted(results.values(), key=lambda x: x['total'], reverse=True)
@@ -1117,7 +1391,7 @@ class AwsFetcher:
         return sorted(results.values(), key=lambda x: x['total'], reverse=True)
 
     def get_instance_bw(self, instance_id, hours, unit='mbps'):
-        # Mapeo de divisores para la fórmula: (Bytes * 8) / (periodo * divisor)
+        # Divisor mapping for formula: (Bytes * 8) / (period * divisor)
         unit_map = {
             'bps': 1,
             'kbps': 1000,
@@ -1156,7 +1430,7 @@ class AwsFetcher:
                         }, 
                         'ReturnData': False
                     },
-                    # Metric Math para Mbps
+                    # Metric Math for Mbps
                     {'Id': 'bw_in', 'Expression': f'(i*8)/({period}*{divisor})', 'ReturnData': True},
                     {'Id': 'bw_out', 'Expression': f'(o*8)/({period}*{divisor})', 'ReturnData': True}
                 ],
@@ -1254,13 +1528,13 @@ def handle_eni_command(args, aws_fetcher, stdout = True):
 
         formatted_output = aws_fetcher.format_eni_output(eni_info, subnet_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1273,17 +1547,21 @@ def handle_subnet_command(args, aws_fetcher, stdout = True):
 
         formatted_output = aws_fetcher.format_subnet_output(subnet_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
 def handle_rt_command(args, aws_fetcher, stdout = True):
+    if not stdout and not args.filter_ip:
+        raise ValueError("filter_ip is mandatory when using aws_tool as a module (rt command).")
+    if args.filter_ip == "all":
+        args.filter_ip = None
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     if stdout:
 	    print(f"{current_time}")
@@ -1292,19 +1570,19 @@ def handle_rt_command(args, aws_fetcher, stdout = True):
             tgw_rt_info = aws_fetcher.get_tgw_route_table_information_by_id(args.identifier)
             formatted_output = aws_fetcher.format_tgw_rt_output(tgw_rt_info, args.filter_ip)
         elif args.identifier.startswith("lgw-rtb-"):
-            formatted_output = aws_fetcher.get_lgw_route_table_information_by_id(args.identifier)
-            # formatted_output = aws_fetcher.format_tgw_rt_output(tgw_rt_info, args.filter_ip)
+            lgw_rt_info = aws_fetcher.get_lgw_route_table_information_by_id(args.identifier)
+            formatted_output = aws_fetcher.format_lgw_rt_output(lgw_rt_info, args.filter_ip)
         else:
             route_table_info = aws_fetcher.get_route_table_information_by_id(args.identifier)
             formatted_output = aws_fetcher.format_rt_output(route_table_info, args.filter_ip)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1319,13 +1597,13 @@ def handle_pl_command(args, aws_fetcher, stdout = True):
             "CIDR Blocks": cidr_blocks
         }
         if stdout:
-            print(yaml.dump(output, sort_keys=False))
+            print(_yaml_dump(output, sort_keys=False))
         else:
             return output
     except Exception as e:
         if stdout:
             print(f"Error: {e}")
-            sys.exit(1)
+            return
         else:
             return f"Error: {e}"
 
@@ -1336,13 +1614,13 @@ def handle_vpc_command(args, aws_fetcher, stdout = True):
     try:
         vpc_info = aws_fetcher.get_vpc_information(args.vpc_id)
         if stdout:
-            print(yaml.dump(vpc_info, sort_keys=False))
+            print(_yaml_dump(vpc_info, sort_keys=False))
         else:
             return vpc_info
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1354,13 +1632,13 @@ def handle_sg_command(args, aws_fetcher, stdout = True):
         sg_info = aws_fetcher.get_security_group_information(args.sg_id)
         formatted_output = aws_fetcher.format_sg_output(sg_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1371,13 +1649,13 @@ def handle_ec2_command(args, aws_fetcher, stdout = True):
     try:
         ec2_info = aws_fetcher.get_instance_information(args.instance_id)
         if stdout:
-            print(yaml.dump(ec2_info, sort_keys=False))
+            print(_yaml_dump(ec2_info, sort_keys=False))
         else:
             return ec2_info
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1389,13 +1667,13 @@ def handle_acl_command(args, aws_fetcher, stdout = True):
         acl_info = aws_fetcher.get_network_acl_information(args.acl_id)
         formatted_output = aws_fetcher.format_acl_output(acl_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1407,13 +1685,13 @@ def handle_tgw_command(args, aws_fetcher, stdout = True):
     try:
         tgw_info = aws_fetcher.get_transit_gateway_information(args.tgw_id)
         if stdout:
-            print(yaml.dump(tgw_info, sort_keys=False))
+            print(_yaml_dump(tgw_info, sort_keys=False))
         else:
             return tgw_info
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1425,13 +1703,13 @@ def handle_dxgw_command(args, aws_fetcher, stdout = True):
         dxgw_info = aws_fetcher.get_dxgw_information(args.dxgw_id)
         formatted_output = aws_fetcher.format_dxgw_output(dxgw_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1443,13 +1721,13 @@ def handle_dxvif_command(args, aws_fetcher, stdout = True):
         dxvif_info = aws_fetcher.get_dxvif_information(args.dxvif_id)
         formatted_output = aws_fetcher.format_dxvif_output(dxvif_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
@@ -1461,43 +1739,186 @@ def handle_dxcon_command(args, aws_fetcher, stdout = True):
         dxcon_info = aws_fetcher.get_dxcon_information(args.dxcon_id)
         formatted_output = aws_fetcher.format_dxcon_output(dxcon_info)
         if stdout:
-            print(yaml.dump(formatted_output, sort_keys=False))
+            print(_yaml_dump(formatted_output, sort_keys=False))
         else:
             return formatted_output
     except Exception as e:
         if stdout:
             print(e)
-            sys.exit(1)
+            return
         else:
             return e
 
 def handle_flowlog_command(args, aws_fetcher, stdout = True):
-    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if stdout:
-	    print(f"{current_time}")
-    try:
-        flowlog_info = aws_fetcher.get_flowlog_information(args.fl_id, args.eni_id, args.hours, args.filter)
-        if stdout:
-            print(yaml.dump(flowlog_info, sort_keys=False))
-        else:
-            return flowlog_info
-    except Exception as e:
-        if stdout:
-            print(e)
-            sys.exit(1)
-        else:
-            return e
+    follow = getattr(args, 'follow', False)
+    interval = getattr(args, 'interval', 5)
+    next_token = None
+    
+    while True:
+        current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if stdout and not follow:
+            print(f"{current_time}")
+            
+        try:
+            flowlog_info, next_token = aws_fetcher.get_flowlog_information(args.fl_id, args.eni_id, args.hours, args.filter, next_token=next_token)
+            if flowlog_info:
+                if stdout:
+                    print(_yaml_dump(flowlog_info, sort_keys=False))
+                elif not follow:
+                    return flowlog_info
+                else:
+                    pass
+            
+            if not follow:
+                break
+                
+            time.sleep(interval)
+            
+        except Exception as e:
+            if stdout:
+                print(e)
+            if not follow:
+                return e if not stdout else None
+            time.sleep(interval)
 
-def handle_find_command(args, stdout = True):
-    result = AwsFinder(args.resource_id, args.profile, args.region, args.verify_ssl)
+def handle_find_command(args, aws_fetcher=None, stdout = True):
+    result = AwsFinder(args.resource_id, args.profile, args.region, getattr(args, 'verify_ssl', True))
     if stdout:
         print(result)
     else:
         return result
 
-def handle_console_command(args, aws_fetcher, connapp, stdout=False):
+def handle_inspect_command(args, aws_fetcher, stdout=True):
+    """Generic inspector that dispatches based on identifier prefix."""
+    identifier = args.identifier
+    id_lower = identifier.lower().replace("-lists ", "").strip()
+
+    # Create a copy of args to avoid modifying the original
+    import copy
+    handler_args = copy.copy(args)
+    handler_args.identifier = id_lower
+
+    handler = None
+    if id_lower.startswith('i-'):
+        handler = handle_ec2_command
+        handler_args.instance_id = id_lower
+    elif id_lower.startswith('vpc-'):
+        handler = handle_vpc_command
+        handler_args.vpc_id = id_lower
+    elif id_lower.startswith('subnet-'):
+        handler = handle_subnet_command
+        handler_args.identifier = id_lower # Subnet handler uses identifier
+    elif id_lower.startswith('eni-'):
+        handler = handle_eni_command
+        handler_args.identifier = id_lower # ENI handler uses identifier
+    elif id_lower.startswith('rtb-') or id_lower.startswith('tgw-rtb-'):
+        handler = handle_rt_command
+        handler_args.identifier = id_lower
+        handler_args.filter_ip = getattr(args, 'filter_ip', None) # RT command expects filter_ip
+    elif id_lower.startswith('tgw-'):
+        handler = handle_tgw_command
+        handler_args.tgw_id = id_lower
+    elif id_lower.startswith('sg-'):
+        handler = handle_sg_command
+        handler_args.sg_id = id_lower
+    elif id_lower.startswith('acl-'):
+        handler = handle_acl_command
+        handler_args.acl_id = id_lower
+    elif id_lower.startswith('dxgw-') or (len(id_lower) == 36 and id_lower.count('-') == 4):
+        handler = handle_dxgw_command
+        handler_args.dxgw_id = id_lower
+    elif id_lower.startswith('dxcon-'):
+        handler = handle_dxcon_command
+        handler_args.dxcon_id = id_lower
+    elif id_lower.startswith('dxvif-'):
+        handler = handle_dxvif_command
+        handler_args.dxvif_id = id_lower
+    elif id_lower.startswith('pl-'):
+        handler = handle_pl_command
+        handler_args.prefix_list_id = id_lower
+    if handler:        return handler(handler_args, aws_fetcher, stdout=stdout)
+    else:
+        msg = f"Unknown identifier type: {identifier}"
+        if stdout:
+            print(msg)
+        return msg
+
+def handle_info_command(args, aws_fetcher=None, stdout=True):
+    import json
+    try:
+        _lazy_init_aws()
+        profiles = list(boto3.Session().available_profiles)
+        regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "us-gov-east-1", "us-gov-west-1", "ca-central-1", "eu-central-1", "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-southeast-1", "ap-southeast-2", "ap-south-1", "sa-east-1"]
+        info = {"profiles": profiles, "regions": regions}
+        if stdout:
+            print(json.dumps(info))
+        else:
+            return info
+    except Exception as e:
+        if stdout:
+            print(json.dumps({"error": str(e)}))
+        else:
+            return {"error": str(e)}
+
+def handle_inventory_command(args, aws_fetcher, stdout=True):
+    import json
+    try:
+        inventory = aws_fetcher.get_full_inventory()
+        if stdout:
+            print(json.dumps(inventory))
+        else:
+            return inventory
+    except Exception as e:
+        if stdout:
+            print(json.dumps({"error": str(e)}))
+        else:
+            return {"error": str(e)}
+
+def handle_flowlog_toggle_command(args, aws_fetcher, stdout=True):
+    """Enable or disable flow logs for an ENI."""
+    import json
+    eni_id = args.identifier
+    action = args.action # 'enable' or 'disable'
+    
+    try:
+        if action == 'enable':
+            log_group = f"/aws/connpy/flowlogs/{eni_id}"
+            response = aws_fetcher.ec2_client.create_flow_logs(
+                ResourceIds=[eni_id],
+                ResourceType='NetworkInterface',
+                TrafficType='ALL',
+                LogDestinationType='cloud-watch-logs',
+                LogGroupName=log_group,
+                DeliverLogsPermissionArn=args.role_arn if hasattr(args, 'role_arn') and args.role_arn else None
+            )
+            res = {"status": "success", "message": f"Flow logs enabled for {eni_id}", "details": response}
+        else:
+            flow_logs = aws_fetcher.ec2_client.describe_flow_logs(
+                Filters=[{'Name': 'resource-id', 'Values': [eni_id]}]
+            )
+            fl_ids = [fl['FlowLogId'] for fl in flow_logs.get('FlowLogs', [])]
+            if fl_ids:
+                aws_fetcher.ec2_client.delete_flow_logs(FlowLogIds=fl_ids)
+                res = {"status": "success", "message": f"Flow logs disabled for {eni_id}"}
+            else:
+                res = {"status": "error", "message": f"No flow logs found for {eni_id}"}
+        
+        if stdout:
+            print(json.dumps(res))
+        return res
+    except Exception as e:
+        res = {"status": "error", "message": str(e)}
+        if stdout:
+            print(json.dumps(res))
+        return res
+
+def handle_console_command(args, aws_fetcher, connapp, stdout=True):
+    import json as _json
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if stdout:
+    
+    is_headless = getattr(connapp, 'is_mock', False) if connapp else True
+    
+    if stdout and not is_headless:
         print(f"{current_time}")
     try:
         # Resolve instance ID
@@ -1514,7 +1935,7 @@ def handle_console_command(args, aws_fetcher, connapp, stdout=False):
             key_path = tempfile.NamedTemporaryFile(delete=False).name
             pub_key_path = key_path + ".pub"
             subprocess.run(["ssh-keygen", "-t", "rsa", "-b", "2048", "-f", key_path, "-N", ""], check=True)
-            if stdout:
+            if stdout and not is_headless:
                 print(f"Generated temporary key at {key_path}")
 
         # Push public key to AWS
@@ -1526,74 +1947,163 @@ def handle_console_command(args, aws_fetcher, connapp, stdout=False):
             "--region", args.region,
             "--profile", args.profile
         ]
-        if not args.verify_ssl:
+        if not getattr(args, 'verify_ssl', True):
             send_key_cmd.append("--no-verify-ssl")
 
         result = subprocess.run(send_key_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print("Error sending SSH key:\n", result.stderr)
+            if is_headless:
+                print(_json.dumps({"error": f"Failed to send SSH key: {result.stderr.strip()}"}))
+            else:
+                print("Error sending SSH key:\n", result.stderr)
             sys.exit(1)
 
         # Connect to AWS serial console
         ssh_user = f"{instance_id}.port{args.port}"
         ssh_host = f"serial-console.ec2-instance-connect.{args.region}.aws"
+        
+        if is_headless:
+            interact_params = {
+                "protocol": "ssh",
+                "host": ssh_host,
+                "user": ssh_user,
+                "name": f"console-{instance_id}@aws",
+                "base_node": "console@aws",
+            }
+            # If no base node exists on the server, include key as fallback
+            if key_path != default_key_path:
+                interact_params["options"] = f"-i {key_path}"
+            print(_json.dumps({"__interact__": interact_params}))
+            return
+            
         if stdout:
             print(f"Connecting to EC2 Serial Console on {ssh_host} as {ssh_user}...")
         if connapp:
             node = connapp.config._getallnodes("console@aws")
-            device = connapp.config.getitem(node[0])
-            device['host'] = ssh_host
-            device['user'] = ssh_user
-            instance = connapp.node("console", **device ,config=connapp.config)
-            instance.interact()
+            if node:
+                device = connapp.config.getitem(node[0])
+                device['host'] = ssh_host
+                device['user'] = ssh_user
+                instance = connapp.node(f"console-{instance_id}@aws", **device, config=connapp.config)
+                instance.interact()
+            else:
+                subprocess.run(["ssh", "-i", key_path, f"{ssh_user}@{ssh_host}"])
         else:
             subprocess.run(["ssh", "-i", key_path, f"{ssh_user}@{ssh_host}"])
 
     except Exception as e:
-        if stdout:
+        if is_headless:
+            print(_json.dumps({"error": str(e)}))
+        elif stdout:
             print(f"Failed to connect to serial console: {e}")
             sys.exit(1)
         else:
             return str(e)
 
-def handle_connect_command(args, connapp, stdout=False):
+
+
+def handle_ssm_command(args, aws_fetcher, connapp, stdout=True):
+    import sys
+    try:
+        instance_info = aws_fetcher.get_instance_information(args.identifier)
+        instance_id = instance_info['id']
+        
+        is_headless = not sys.stdout.isatty()
+        
+        # 1. If remote (headless), return JSON payload.
+        if is_headless:
+            import json as _json
+            interact_params = {
+                "protocol": "ssm",
+                "host": instance_id,
+                "name": f"ssm-{instance_id}@aws",
+                "base_node": "ssm@aws",
+                "tags": {"region": args.region, "profile": args.profile}
+            }
+            print(_json.dumps({"__interact__": interact_params}))
+            return
+
+        if stdout:
+            print(f"Connecting to EC2 instance {instance_id} via SSM...")
+
+        # 2. If within connpy CLI, use Pexpect (core.node)
+        if connapp:
+            node = connapp.config._getallnodes("ssm@aws")
+            if node:
+                device = connapp.config.getitem(node[0]).copy()
+            else:
+                # If no ssm@aws base node, initialize an empty one
+                device = {}
+                
+            device['host'] = instance_id
+            device['protocol'] = "ssm"
+            
+            # Preserve existing tags (e.g. prompt, console) if any
+            existing_tags = device.get('tags', {})
+            if not isinstance(existing_tags, dict):
+                existing_tags = {}
+                
+            existing_tags['region'] = args.region
+            existing_tags['profile'] = args.profile
+            device['tags'] = existing_tags
+            
+            # Instantiate connpy core and connect
+            instance = connapp.node(f"ssm-{instance_id}@aws", **device, config=connapp.config)
+            instance.interact()
+            
+        # 3. Fallback: Ejecucion directa sin connpy
+        else:
+            import subprocess
+            subprocess.run(["aws", "ssm", "start-session", "--target", instance_id, "--region", args.region, "--profile", args.profile])
+            
+    except Exception as e:
+        import sys
+        if not sys.stdout.isatty():
+            import json as _json
+            print(_json.dumps({"error": str(e)}))
+        elif stdout:
+            print(f"Error: {e}")
+
+def handle_connect_command(args, connapp, stdout=True):
+    _lazy_init_k8s()
     ctx = []
-    # <--- CAMBIO 1: La expresión regular ahora acepta un número opcional después de 'p' o 's'.
-    # Esto permite que coincida con 'mi-dc-p', 'mi-dc-s1', 'mi-dc-p2', etc.
+    # <--- CHANGE 1: The regex now accepts an optional number after 'p' or 's'.
+    # This allows matching with 'mi-dc-p', 'mi-dc-s1', 'mi-dc-p2', etc.
     _ENV_RE = re.compile(r'^([a-zA-Z0-9\-]+)-([sp])(\d*)$', re.IGNORECASE)
     namespaces = []
     
-    if connapp:
-        choose = connapp._choose
-    else:
-        # <--- CAMBIO 2: Mejoramos la función 'choose' para que funcione con listas de
-        # strings y también con listas de objetos (como los pods de k8s).
-        # Muestra el nombre al usuario pero devuelve el objeto completo, lo que simplifica el código.
-        def choose(list_items, name, action):
-            if not list_items:
-                return None
-            
-            # Si la lista contiene objetos con 'metadata' (como los pods), usa el nombre para las opciones.
-            if hasattr(list_items[0], 'metadata'):
-                choices = [item.metadata.name for item in list_items]
-            else:
-                choices = list_items
+    # <--- CHANGE 2: We improved the 'choose' function to work with lists of
+    # strings and also with lists of objects (like k8s pods).
+    # Shows name to the user but returns the complete object, simplifying code.
+    def choose(list_items, name, action):
+        if not list_items:
+            return None
+        
+        # If list contains objects with 'metadata' (like pods), use the name for options.
+        if hasattr(list_items[0], 'metadata'):
+            choices = [item.metadata.name for item in list_items]
+        else:
+            choices = list_items
 
+        if connapp:
+            from connpy.cli.helpers import choose as cli_choose
+            selected_name = cli_choose(connapp, choices, name, action)
+        else:
             questions = [inquirer.List(name, message=f"Pick {name} to {action}:", choices=choices, carousel=True)]
             answer = inquirer.prompt(questions)
-            if answer is None:
-                return None
-            
-            selected_name = answer[name]
-            
-            # Devuelve el objeto completo que corresponde al nombre elegido.
-            if hasattr(list_items[0], 'metadata'):
-                for item in list_items:
-                    if item.metadata.name == selected_name:
-                        return item
-            
-            # Si era una lista de strings, devuelve el string.
-            return selected_name
+            selected_name = answer[name] if answer else None
+
+        if selected_name is None:
+            return None
+        
+        # Returns the complete object corresponding to the chosen name.
+        if hasattr(list_items[0], 'metadata'):
+            for item in list_items:
+                if item.metadata.name == selected_name:
+                    return item
+        
+        # If it was a list of strings, return the string.
+        return selected_name
 
     try:
         contexts, current = k8s_config.list_kube_config_contexts()
@@ -1615,11 +2125,11 @@ def handle_connect_command(args, connapp, stdout=False):
         if not m:
             continue
         base, role = m.group(1), m.group(2).lower()
-        # <--- CAMBIO 3: Guardamos los contextos en una lista para cada rol ('p' o 's').
-        # Ahora env_map puede tener: {'mi-dc': {'p': ['mi-dc-p1', 'mi-dc-p2'], 's': ['mi-dc-s1']}}
+        # <--- CHANGE 3: We save the contexts in a list for each role ('p' or 's').
+        # Now env_map can have: {'mi-dc': {'p': ['mi-dc-p1', 'mi-dc-p2'], 's': ['mi-dc-s1']}}
         env_map.setdefault(base, {}).setdefault(role, []).append(name)
 
-    # Si no hay contextos que coincidan con el patrón, se usa el flujo original (fallback)
+    # If no contexts match the pattern, use original flow (fallback)
     if not env_map:
         chosen_ctx_name = ctx[0]
         if len(ctx) > 1:
@@ -1627,7 +2137,7 @@ def handle_connect_command(args, connapp, stdout=False):
         if chosen_ctx_name is None:
             sys.exit(7)
         
-        ctx = [chosen_ctx_name] # Actualizamos ctx para que el resto del flujo lo use
+        ctx = [chosen_ctx_name] # Update ctx for the rest of the flow to use
         k8s_config.load_kube_config(context=ctx[0])
         v1 = k8s_client.CoreV1Api()
         ns_list = v1.list_namespace()
@@ -1655,24 +2165,28 @@ def handle_connect_command(args, connapp, stdout=False):
             chosen_pod = choose(pods, "pod", "connect")
         if chosen_pod is None:
             sys.exit(7)
-        pod_name = chosen_pod.metadata.name # Obtenemos el nombre del objeto pod
+        pod_name = chosen_pod.metadata.name # Get the name of the pod object
         
         if connapp:
             node = connapp.config._getallnodes("connect@aws")
-            device = connapp.config.getitem(node[0])
-            device["options"] = f"--context={ctx[0]} -n {ns_selected}"
-            device["host"] = pod_name
-            if args.local:
-                device["user"] = "@xrd"
-                device["password"] = ["@xrd"]
-            instance = connapp.node(pod_name, **device, config=connapp.config)
-            instance.interact()
+            if node:
+                device = connapp.config.getitem(node[0])
+                device["options"] = f"--context={ctx[0]} -n {ns_selected}"
+                device["host"] = pod_name
+                if args.local:
+                    device["user"] = "@xrd"
+                    device["password"] = ["@xrd"]
+                instance = connapp.node(pod_name, **device, config=connapp.config)
+                instance.interact()
+            else:
+                command = f"kubectl --context={ctx[0]} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
+                subprocess.run(shlex.split(command))
         else:
             command = f"kubectl --context={ctx[0]} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
             subprocess.run(shlex.split(command))
         return
 
-    # --- INICIO DEL NUEVO FLUJO MEJORADO ---
+    # --- START OF NEW IMPROVED FLOW ---
     
     env_list = sorted(env_map.keys())
     chosen_env = env_list[0]
@@ -1681,10 +2195,10 @@ def handle_connect_command(args, connapp, stdout=False):
     if chosen_env is None:
         sys.exit(7)
 
-    # <--- CAMBIO 4: Buscamos namespaces en TODOS los clústeres del entorno elegido.
+    # <--- CHANGE 4: Search namespaces in ALL clusters of the chosen environment.
     ns_by_context = {}
     all_ns = set()
-    # Creamos una lista única de todos los contextos (p1, p2, s1...)
+    # Create a unique list of all contexts (p1, p2, s1...)
     contexts_to_scan = env_map[chosen_env].get("p", []) + env_map[chosen_env].get("s", [])
 
     for ctx_name in contexts_to_scan:
@@ -1692,10 +2206,10 @@ def handle_connect_command(args, connapp, stdout=False):
             k8s_config.load_kube_config(context=ctx_name)
             v1 = k8s_client.CoreV1Api()
             ns_list = v1.list_namespace()
-            # Guardamos los namespaces por cada contexto específico
+            # Save namespaces for each specific context
             context_namespaces = {ns.metadata.name for ns in ns_list.items}
             ns_by_context[ctx_name] = context_namespaces
-            all_ns.update(context_namespaces) # Agregamos al conjunto total de namespaces
+            all_ns.update(context_namespaces) # Add to the total set of namespaces
         except Exception as e:
             if stdout:
                 print(f"Warning: Error listing namespaces for {ctx_name}: {e}")
@@ -1711,8 +2225,8 @@ def handle_connect_command(args, connapp, stdout=False):
     if ns_selected is None:
         sys.exit(7)
 
-    # <--- CAMBIO 5: Determinamos en qué contexto(s) existe el namespace y preguntamos si hay más de uno.
-    # Ya no pensamos en 'roles' (p/s) sino en contextos específicos ('mi-dc-p1', 'mi-dc-s2').
+    # <--- CHANGE 5: Determine in which context(s) the namespace exists and ask if there is more than one.
+    # We no longer think about 'roles' (p/s) but specific contexts ('mi-dc-p1', 'mi-dc-s2').
     present_in_contexts = [ctx for ctx, ns_set in ns_by_context.items() if ns_selected in ns_set]
     
     if not present_in_contexts:
@@ -1721,12 +2235,12 @@ def handle_connect_command(args, connapp, stdout=False):
 
     selected_ctx = present_in_contexts[0]
     if len(present_in_contexts) > 1:
-        # Si el namespace existe en 'mi-dc-p1' y 'mi-dc-s2', el usuario elige a cuál conectar.
+        # If namespace exists in 'mi-dc-p1' and 'mi-dc-s2', user chooses which to connect.
         selected_ctx = choose(present_in_contexts, "context", f"for namespace {ns_selected}")
     if selected_ctx is None:
         sys.exit(7)
 
-    # Cargar contexto final y elegir pod
+    # Load final context and choose pod
     k8s_config.load_kube_config(context=selected_ctx)
     v1 = k8s_client.CoreV1Api()
     pods = v1.list_namespaced_pod(namespace=ns_selected).items
@@ -1741,38 +2255,59 @@ def handle_connect_command(args, connapp, stdout=False):
         sys.exit(7)
     pod_name = chosen_pod.metadata.name
 
+    is_headless = not sys.stdout.isatty()
+    if is_headless:
+        import json as _json
+        interact_params = {
+            "protocol": "kubectl",
+            "host": pod_name,
+            "base_node": "connect@aws",
+            "options": f"--context={selected_ctx} -n {ns_selected}",
+            "tags": {"kube_command": "/pkg/bin/xr_cli.sh"}
+        }
+        if getattr(args, "local", False):
+            interact_params["user"] = "@xrd"
+            interact_params["password"] = ["@xrd"]
+        print(_json.dumps({"__interact__": interact_params}))
+        return
+
     if connapp:
         node = connapp.config._getallnodes("connect@aws")
-        device = connapp.config.getitem(node[0])
-        device["options"] = f"--context={selected_ctx} -n {ns_selected}"
-        device["host"] = pod_name
-        if getattr(args, "local", False):
-            device["user"] = "@xrd"
-            device["password"] = ["@xrd"]
-        instance = connapp.node(pod_name, **device, config=connapp.config)
-        instance.interact()
+        if node:
+            device = connapp.config.getitem(node[0])
+            device["options"] = f"--context={selected_ctx} -n {ns_selected}"
+            device["host"] = pod_name
+            if getattr(args, "local", False):
+                device["user"] = "@xrd"
+                device["password"] = ["@xrd"]
+            instance = connapp.node(pod_name, **device, config=connapp.config)
+            instance.interact()
+        else:
+            command = f"kubectl --context={selected_ctx} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
+            subprocess.run(shlex.split(command))
     else:
         command = f"kubectl --context={selected_ctx} exec -it -n {ns_selected} {pod_name} -- /pkg/bin/xr_cli.sh"
         subprocess.run(shlex.split(command))
 
 def handle_bw_command(args, aws_fetcher, stdout=True):
+    _lazy_init_plot()
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     
     if not args.instance_id:
         if stdout:
             print(f"Fetching Throughput list ({args.unit})... {current_time}")
         try:
-            # Pasamos la unidad al fetcher para que la lista ya venga calculada
+            # Pass the unit to the fetcher so the list comes pre-calculated
             bw_list = aws_fetcher.get_all_instances_bw(unit=args.unit)
             
             if stdout:
-                # El header ahora inyecta la unidad elegida
+                # The header now injects the chosen unit
                 u = args.unit.upper()
                 header = f"{'Instance ID':<20} | {f'In ({u})':<10} | {f'Out ({u})':<10} | {f'Total ({u})':<10} | {'Name'}"
                 print("\n" + header)
                 print("-" * 125)
                 for r in bw_list:
-                    # Usamos .2f para mantener precisión en KB o MB
+                    # Use .2f to maintain precision in KB or MB
                     print(f"{r['id']:<20} | {r['in']:<10.2f} | {r['out']:<10.2f} | {r['total']:<10.2f} | {r['name']}")
             else:
                 return bw_list
@@ -1788,12 +2323,19 @@ def handle_bw_command(args, aws_fetcher, stdout=True):
             target_id = instance_info['id']
             target_name = instance_info['name']
             
+            if getattr(args, 'json_output', False):
+                import json
+                print(json.dumps(aws_fetcher.get_instance_bw(target_id, args.time, unit=args.unit)))
+                return
+            elif not stdout:
+                return aws_fetcher.get_instance_bw(target_id, args.time, unit=args.unit)
+
             if stdout:
                 print(f"Starting live BW monitor for {target_name} ({target_id})...")
                 print("Press Ctrl+C to stop.")
                 
             while True:
-                # El fetcher debería convertir de Bytes a Mbps aquí
+                # Fetcher should convert from Bytes to Mbps here
                 data = aws_fetcher.get_instance_bw(target_id, args.time, unit=args.unit)
                 
                 if not data['in']:
@@ -1828,6 +2370,7 @@ def handle_bw_command(args, aws_fetcher, stdout=True):
                 return str(e)
 
 def handle_pps_command(args, aws_fetcher, stdout=True):
+    _lazy_init_plot()
     current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     
     if not args.instance_id:
@@ -1855,6 +2398,13 @@ def handle_pps_command(args, aws_fetcher, stdout=True):
             target_id = instance_info['id']
             target_name = instance_info['name']
             
+            if getattr(args, 'json_output', False):
+                import json
+                print(json.dumps(aws_fetcher.get_instance_pps(target_id, args.time)))
+                return
+            elif not stdout:
+                return aws_fetcher.get_instance_pps(target_id, args.time)
+
             if stdout:
                 print(f"Starting live PPS monitor for {target_name} ({target_id})...")
                 print("Press Ctrl+C to stop.")
@@ -1892,6 +2442,60 @@ def handle_pps_command(args, aws_fetcher, stdout=True):
                 sys.exit(1)
             else:
                 return str(e)
+
+def handle_open_command(args, aws_fetcher, stdout=True):
+    import urllib.parse
+    import requests
+    import subprocess
+    import json as _json
+
+    if not getattr(args, 'profile', None) or not getattr(args, 'region', None):
+        msg = "Error: Both --profile and --region are required for the open command."
+        if stdout:
+            print(msg)
+        return msg
+
+    try:
+        session = boto3.Session(profile_name=args.profile, region_name=args.region)
+        creds = session.get_credentials()
+        if not creds:
+            raise ValueError(f"No credentials found for profile '{args.profile}'")
+        
+        creds = creds.get_frozen_credentials()
+        
+        session_data = {
+            "sessionId": creds.access_key,
+            "sessionKey": creds.secret_key
+        }
+        if creds.token:
+            session_data["sessionToken"] = creds.token
+            
+        session_json = _json.dumps(session_data)
+        
+        token_url = f"https://signin.aws.amazon.com/federation?Action=getSigninToken&SessionType=json&Session={urllib.parse.quote(session_json)}"
+        r = requests.get(token_url)
+        if r.status_code != 200:
+            raise ValueError(f"Failed to get SigninToken from AWS: {r.text}")
+        signin_token = r.json().get("SigninToken")
+        if not signin_token:
+            raise ValueError(f"No SigninToken in AWS response: {r.text}")
+        
+        destination = f"https://{args.region}.console.aws.amazon.com/console/home?region={args.region}"
+        console_url = f"https://signin.aws.amazon.com/federation?Action=login&Issuer=connpy&Destination={urllib.parse.quote(destination)}&SigninToken={signin_token}"
+        
+        granted_uri = f"ext+granted-containers:name={urllib.parse.quote(args.profile)}&url={urllib.parse.quote(console_url)}"
+        
+        if stdout:
+            print(f"Opening console for profile '{args.profile}' in container via Firefox extension...")
+            
+        import webbrowser
+        webbrowser.open(granted_uri)
+        return "Console opened successfully."
+    except Exception as e:
+        msg = f"Error opening console in container: {e}"
+        if stdout:
+            print(msg)
+        return msg
 
 class Parser:
     def __init__(self):
@@ -1976,6 +2580,8 @@ class Parser:
         parser_flowlog.set_defaults(func=handle_flowlog_command)
         parser_flowlog.add_argument('--hours', type=int, default=1, help='Number of hours to capture (default: 1)')
         parser_flowlog.add_argument('--filter', type=str, default=None, help='Optional filter for flow logs')
+        parser_flowlog.add_argument('--follow', action='store_true', help='Stream flow logs in real-time')
+        parser_flowlog.add_argument('--interval', type=int, default=5, help='Polling interval in seconds for stream (default: 5)')
 
         # Find subparser
         parser_find = subparsers.add_parser('find', help='Find resource location')
@@ -1989,6 +2595,12 @@ class Parser:
         parser_console.add_argument('--user', default='ec2-user', help='SSH username (default: ec2-user)')
         parser_console.set_defaults(func=handle_console_command)
 
+
+        # SSM subparser
+        parser_ssm = subparsers.add_parser('ssm', help='Connect to EC2 via SSM')
+        parser_ssm.add_argument('identifier', help='Instance ID or Name tag')
+        parser_ssm.set_defaults(func=handle_ssm_command)
+
         # Connect subparser
         parser_connect = subparsers.add_parser('connect', help='Connect to XRD vrouter')
         parser_connect.add_argument(
@@ -2000,6 +2612,10 @@ class Parser:
                 )
         parser_connect.set_defaults(func=handle_connect_command)
 
+        # Open subparser
+        parser_open = subparsers.add_parser('open', help='Open AWS Console in Firefox Multi-Account Containers via assume')
+        parser_open.set_defaults(func=handle_open_command)
+
         # PPS parser
         parser_pps = subparsers.add_parser('pps', help='Monitor Packets Per Second (PPS) performance')
         parser_pps.add_argument('-i', '--instance-id', help='Instance ID or Name Tag to graph (ASCII top mode)')
@@ -2010,17 +2626,216 @@ class Parser:
         parser_bw = subparsers.add_parser('bw', aliases=['throughput'], help='Monitor Throughput/Bandwidth performance')
         parser_bw.add_argument('-i', '--instance-id', help='Instance ID or Name Tag to graph (ASCII top mode)')
         parser_bw.add_argument('-t', '--time', type=int, default=1, help='Hours to look back for the graph')
-        # Puedes agregar una unidad opcional si tus scripts lo soportan (bps, kbps, mbps)
+        # You can add an optional unit if your scripts support it (bps, kbps, mbps)
         parser_bw.add_argument('-u', '--unit', choices=['bps', 'kbps', 'mbps', 'gbps'], default='mbps', help='Unit for the graph (default: mbps)')
         parser_bw.set_defaults(func=handle_bw_command)
 
+def format_aws_error(e):
+    """Format technical AWS errors into clean, readable messages."""
+    error_str = str(e)
+    
+    # Handle Boto3 ClientError structure if possible
+    if hasattr(e, 'response') and 'Error' in e.response:
+        code = e.response['Error'].get('Code', 'UnknownError')
+        message = e.response['Error'].get('Message', error_str)
+        
+        # Prettify common codes
+        if 'NotFound' in code:
+            return f"Resource NOT FOUND: {message}"
+        if 'AccessDenied' in code or 'Forbidden' in code:
+            return f"ACCESS DENIED: {message}"
+        if 'ValidationError' in code:
+            return f"VALIDATION ERROR: {message}"
+            
+        return f"{code}: {message}"
+    
+    # Fallback for generic errors: strip the common "An error occurred..." boilerplate
+    import re
+    clean_msg = re.sub(r'An error occurred \([^)]+\) when calling the [^ ]+ operation: ', '', error_str)
+    return clean_msg
+
+def _fzf_match(value, options, name="Option"):
+    if not value or value in options:
+        return value
+        
+    def score_match(query, candidate):
+        query = query.lower()
+        candidate = candidate.lower()
+        
+        if query == candidate:
+            return 1000
+            
+        parts = candidate.split('-')
+        acronym = "".join(p[0] for p in parts if p)
+        if query == acronym:
+            return 500
+            
+        import re
+        pattern = ".*".join(re.escape(c) for c in query)
+        if not re.search(pattern, candidate):
+            return 0
+            
+        score = 100
+        idx = 0
+        match_initials = 0
+        for char in query:
+            next_idx = candidate.find(char, idx)
+            if next_idx == -1:
+                break
+            if next_idx == 0 or candidate[next_idx-1] == '-':
+                match_initials += 1
+            idx = next_idx + 1
+            
+        score += match_initials * 10
+        score -= len(candidate)
+        return score
+
+    scored_options = [(opt, score_match(value, opt)) for opt in options]
+    matches = [(opt, score) for opt, score in scored_options if score > 0]
+    
+    if not matches:
+        return value
+        
+    matches.sort(key=lambda x: x[1], reverse=True)
+    
+    top_score = matches[0][1]
+    best_matches = [opt for opt, score in matches if score == top_score]
+    
+    if len(best_matches) == 1:
+        return best_matches[0]
+    else:
+        raise ValueError(f"Ambiguous {name} '{value}'. Best matches: {', '.join(best_matches)}")
+
+def _resolve_args(args):
+    _lazy_init_aws()
+    try:
+        profiles = list(boto3.Session().available_profiles)
+    except:
+        profiles = []
+    try:
+        regions = list(boto3.Session().get_available_regions('ec2'))
+    except:
+        regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+
+    if hasattr(args, 'region') and args.region:
+        args.region = _fzf_match(args.region, regions, "region")
+    if hasattr(args, 'profile') and args.profile:
+        args.profile = _fzf_match(args.profile, profiles, "profile")
+
+
+def _aws_tool_handler(ai_instance, command, identifier=None, profile=None, region=None, filter_ip=None, **kwargs):
+    """AWS tool handler for the AI system. Called by ai.py dispatch."""
+    import json as _json
+    if command == 'rt' and not filter_ip:
+        return "Error: 'filter_ip' is MANDATORY for route table queries. Provide an IP or subnet to filter (use 'all' for full table)."
+
+    try:
+        class Args:
+            def __init__(self, **entries): self.__dict__.update(entries)
+        p = profile
+        r = region
+        if command != 'find' and not r:
+             r = os.getenv('AWS_REGION') or ai_instance.config.config.get("aws", {}).get("region") or "us-east-1"
+        
+        try:
+            _lazy_init_aws()
+            try:
+                profiles = list(boto3.Session().available_profiles)
+            except:
+                profiles = []
+            try:
+                regions = list(boto3.Session().get_available_regions('ec2'))
+            except:
+                regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+            if p: p = _fzf_match(p, profiles, "profile")
+            if r: r = _fzf_match(r, regions, "region")
+        except ValueError as e:
+            return f"Error: {e}"
+
+        
+        args = Args(command=command, identifier=identifier, resource_id=identifier,
+                    vpc_id=identifier, sg_id=identifier, instance_id=identifier,
+                    acl_id=identifier, tgw_id=identifier, dxgw_id=identifier,
+                    dxvif_id=identifier, dxcon_id=identifier, prefix_list_id=identifier,
+                    filter_ip=filter_ip, profile=p, region=r, verify_ssl=True)
+        if command == 'find':
+            fetcher = None
+        else:
+            if not p:
+                p = os.getenv('AWS_PROFILE') or ai_instance.config.config.get("aws", {}).get("profile")
+            if not r:
+                r = os.getenv('AWS_REGION') or ai_instance.config.config.get("aws", {}).get("region")
+            
+            if not p or not r:
+                return "Error: Both 'profile' and 'region' must be specified for this command. If you don't know them, use the 'find' command first to locate the resource."
+            
+            args.profile = p
+            args.region = r
+            fetcher = AwsFetcher(profile=p, region=r)
+        handlers = {
+            "eni": handle_eni_command, "subnet": handle_subnet_command,
+            "rt": handle_rt_command, "pl": handle_pl_command,
+            "vpc": handle_vpc_command, "sg": handle_sg_command,
+            "ec2": handle_ec2_command, "acl": handle_acl_command,
+            "tgw": handle_tgw_command, "dxgw": handle_dxgw_command,
+            "vif": handle_dxvif_command, "dxcon": handle_dxcon_command,
+            "find": handle_find_command, "open": handle_open_command
+        }
+        if command not in handlers:
+            return f"Error: Unknown AWS command '{command}'."
+        data = handlers[command](args, fetcher, stdout=False)
+        return ai_instance._truncate(_json.dumps(data, default=str))
+    except Exception as e:
+        return f"Error executing AWS command: {format_aws_error(e)}"
+
+
+def _aws_status_formatter(args):
+    """Format status line for AWS tool calls in the AI UI."""
+    return f"[bold blue]Engineer: [AWS] {args.get('command', '')} {args.get('identifier', '')}"
+
+
+def _register_aws_ai_tools(ai_instance):
+    """Called by ClassHook.modify on every new ai instance to register AWS tools."""
+    tool_definition = {
+        "type": "function",
+        "function": {
+            "name": "aws_tool",
+            "description": "Interacts with AWS resources. MANDATORY: Use 'rt' for ALL route tables (VPC, TGW, LGW). If identifier starts with 'tgw-rtb-', use 'rt'. Use 'tgw' ONLY for the Transit Gateway resource itself. Always use 'filter_ip' with 'rt' if an IP is relevant (use 'all' for full table).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "find", "open"]},
+                    "identifier": {"type": "string", "description": "Resource ID (e.g. eni-..., subnet-..., tgw-rtb-...)."},
+                    "profile": {"type": "string"},
+                    "region": {"type": "string"},
+                    "filter_ip": {"type": "string", "description": "IP/Subnet to filter results in 'rt' or 'tgw' commands."}
+                },
+                "required": ["command", "identifier"]
+            }
+        }
+    }
+
+    ai_instance.register_ai_tool(
+        tool_definition=tool_definition,
+        handler=_aws_tool_handler,
+        target="engineer",
+        engineer_prompt="- AWS Cloud Auditing: Use 'aws_tool' to query ENIs, VPCs, Route Tables (VPC/TGW), Security Groups, ACLs, Direct Connect resources. MANDATORY: Use 'filter_ip' for route table queries (use 'all' to see full table).",
+        architect_prompt="  * Audit AWS: ENIs, VPCs, Route Tables (VPC/TGW), SGs, ACLs, Direct Connect (aws_tool).",
+        status_formatter=_aws_status_formatter
+    )
+
+
 class Preload:
     def __init__(self, connapp):
+
+        # Register AWS tools with the AI system
+        connapp.ai.modify(_register_aws_ai_tools)
 
         try:
             @connapp.app.route("/aws_info", methods=["POST"])
             def aws_info():
                 try:
+                    _lazy_init_aws()
                     profiles = boto3.Session().available_profiles
                     regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
                     parser = Parser()
@@ -2028,11 +2843,12 @@ class Preload:
                     subparsers = [key for key in subparsers_action.choices.keys()]
                     return {"regions": regions, "profiles": profiles, "commands": subparsers}
                 except Exception as e:
-                    return {"result": str(e)}
+                    return {"result": format_aws_error(e)}
 
             @connapp.app.route("/aws_command", methods=["POST"])
             def aws_command():
                 try:
+                    _lazy_init_flask()
                     data = request.get_json()
                     command = data["command"]
                     fake_args = shlex.split(command)
@@ -2053,6 +2869,12 @@ class Preload:
                     args = parser.parser.parse_args(fake_args)
                     warnings.simplefilter('ignore', InsecureRequestWarning)
 
+                    try:
+                        _resolve_args(args)
+                    except ValueError as e:
+                        return {"result": f"Error: {str(e)}"}
+
+
                     if args.command == 'find':
                         if hasattr(args, 'func'):
                             result = args.func(args, stdout=False)
@@ -2060,21 +2882,35 @@ class Preload:
                     else:
                         if not args.region or not args.profile:
                             return {"result": "Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE."}
-                        aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
+                        aws_fetcher = AwsFetcher(args.profile, args.region, getattr(args, 'verify_ssl', True))
                         if hasattr(args, 'func'):
                             result = args.func(args, aws_fetcher, stdout=False)
                             return result
 
                 except Exception as e:
-                    return {"result": str(e)}
+                    return {"result": format_aws_error(e)}
 
         except:
             pass
 
 class Entrypoint:
     def __init__(self, args, parser, connapp):
+        _lazy_init_aws()
         # Suppress only the single InsecureRequestWarning from urllib3 needed
         warnings.simplefilter('ignore', InsecureRequestWarning)
+
+        # Normalize all possible AWS identifiers to lowercase globally
+        id_fields = ['identifier', 'resource_id', 'instance_id', 'vpc_id', 'subnet_id', 'eni_id', 'tgw_id', 'sg_id', 'acl_id', 'dxgw_id', 'dxcon_id', 'dxvif_id', 'eni_id']
+        for field in id_fields:
+            val = getattr(args, field, None)
+            if isinstance(val, str):
+                setattr(args, field, val.lower())
+
+        try:
+            _resolve_args(args)
+        except ValueError as e:
+            parser.error(str(e))
+
         if args.command:
             if args.command == 'find':
                 if hasattr(args, 'func'):
@@ -2085,68 +2921,110 @@ class Entrypoint:
             else:
                 if not args.region or not args.profile:
                     parser.error("Both --region and --profile must be specified for this command or use environment variables AWS_REGION and AWS_PROFILE.")
-                aws_fetcher = AwsFetcher(args.profile, args.region, args.verify_ssl)
+                aws_fetcher = AwsFetcher(args.profile, args.region, getattr(args, 'verify_ssl', True))
                 if hasattr(args, 'func'):
-                    if args.command == 'console':
+                    if args.command == 'console' or args.command == 'ssm':
                         args.func(args, aws_fetcher,connapp)
                     else:
                         args.func(args, aws_fetcher)
         else:
             parser.print_help()
 
-def _connpy_completion(wordsnumber, words, info = None):
-    mandatory_options = ["--profile", "--region"]
-    mandatory_options_short = ["--profile", "--region", "-p", "-r"]
-    if wordsnumber == 3:
-        result = ["--profile", "--region", "--no-verify-ssl", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog",  "console", "connect", "--help", "--no-verify-ssl"]
-    elif wordsnumber == 4:
-        if words[1] == "--no-verify-ssl":
-            result = ["--profile", "--region", "find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "connect"]
-        elif words[1] in ["-r", "--region"]:
-            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
-        elif words[1] in ["-p", "--profile"]:
-            result = boto3.Session().available_profiles
-        elif words[1] == "flowlog":
-            result = ["--filter", "--hours"]
-    elif wordsnumber == 5:
-        if words[1] in mandatory_options_short:
-            result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--no-verify-ssl"])
-        elif words[2] in ["-r", "--region"]:
-            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
-        elif words[2] in ["-p", "--profile"]:
-            result = boto3.Session().available_profiles
-        elif words[2] == "flowlog":
-            result = ["--filter", "--hours"]
-    elif wordsnumber == 6:
-        if words[2] in mandatory_options_short or words[3] == "--no-verify-ssl":
-            result = [item for item in mandatory_options if not any(word in item for word in words[:-1])]
-            result.extend(["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console"])
-        elif words[3] in ["-r", "--region"]:
-            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
-        elif words[3] in ["-p", "--profile"]:
-            result = boto3.Session().available_profiles
-        elif words[3] == "flowlog" or (words[1] == "flowlog" and words[2] not in ["--filter"]):
-            result = ["--filter", "--hours"]
-    elif wordsnumber == 7:
-        if words[1] in mandatory_options_short and words[3] in mandatory_options_short:
-            result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--help", "--no-verify-ssl"]
-        elif words[4] in ["-r", "--region"]:
-            result = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
-        elif words[4] in ["-p", "--profile"]:
-            result = boto3.Session().available_profiles
-        elif words[4] == "flowlog" or (words[2] == "flowlog" and words[3] not in ["--filter"]):
-            result = ["--filter", "--hours"]
-    elif wordsnumber > 7 and ( words[3] == "flowlog" or words[4] == "flowlog" or words[5] == "flowlog" or words[6] == "flowlog"):
-        if not words[-2] in ["--filter", "--hours"]:
-            result = [item for item in ["--filter", "--hours"] if not any(word in item for word in words[:-1])]
-    elif wordsnumber == 8:
-        if "--no-verify-ssl" in words:
-            if (words[1] in mandatory_options_short or words[2] in mandatory_options_short) and (words[3] in mandatory_options_short or words[4] in mandatory_options):
-                result = ["find", "eni", "subnet", "rt", "pl", "vpc", "sg", "ec2", "acl", "tgw", "dxgw", "vif", "dxcon", "flowlog", "console", "--help"]
-    return result
+def _connpy_tree(info=None):
+    """Return a completion tree node for the aws plugin.
+    
+    This is the new plugin completion API. The main completion engine
+    integrates this node directly into the CLI tree under "aws".
+    """
+    regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+    try:
+        import boto3 as _boto3
+        profiles = list(_boto3.Session().available_profiles)
+    except Exception:
+        profiles = []
+
+    # --- Subcommand-specific state machines ---
+
+    flowlog_dict = {}
+    flowlog_dict.update({
+        "__exclude_used__": True,
+        "--filter": {"*": flowlog_dict},
+        "--hours":  {"*": flowlog_dict},
+        "*": flowlog_dict,  # absorb positional args (fl_id, eni_id)
+    })
+
+    pps_dict = {}
+    pps_dict.update({
+        "__exclude_used__": True,
+        "--instance-id": {"*": pps_dict},
+        "--time":         {"*": pps_dict},
+        "*": pps_dict,
+    })
+
+    bw_dict = {}
+    bw_dict.update({
+        "__exclude_used__": True,
+        "--instance-id": {"*": bw_dict},
+        "--time":         {"*": bw_dict},
+        "--unit": ["bps", "kbps", "mbps", "gbps"],
+        "*": bw_dict,
+    })
+
+    console_dict = {}
+    console_dict.update({
+        "__exclude_used__": True,
+        "--port": {"*": console_dict},
+        "--user": {"*": console_dict},
+        "*": console_dict,
+    })
+
+    ssm_dict = {}
+    ssm_dict.update({
+        "__exclude_used__": True,
+        "*": ssm_dict,
+    })
+
+    # --- Top-level aws node (global flags + subcommands, self-referential) ---
+    # Global flags --profile / --region can appear before the subcommand in any order.
+    # "*" absorbs unknown positional words (e.g. the value after --profile).
+    # "__exclude_used__" ensures already-typed flags are not re-suggested.
+    aws_top = {}
+    aws_top.update({
+        "__exclude_used__": True,
+        "--profile": {"*": aws_top, "__extra__": lambda w: profiles},
+        "--region":  {"*": aws_top, "__extra__": lambda w: regions},
+        "-p":        {"*": aws_top, "__extra__": lambda w: profiles},
+        "-r":        {"*": aws_top, "__extra__": lambda w: regions},
+        "--no-verify-ssl": aws_top,   # boolean flag, loops back immediately
+        "--help": None,
+        # Subcommands
+        "find":    None,
+        "eni":     None,
+        "subnet":  None,
+        "rt":      None,
+        "pl":      None,
+        "vpc":     None,
+        "sg":      None,
+        "ec2":     None,
+        "acl":     None,
+        "tgw":     None,
+        "dxgw":    None,
+        "vif":     None,
+        "dxcon":   None,
+        "flowlog": flowlog_dict,
+        "console": console_dict,
+        "ssm":     ssm_dict,
+        "connect": {"-l": None, "--local": None},
+        "pps":     pps_dict,
+        "bw":      bw_dict,
+    })
+    return aws_top
 
 if __name__ == "__main__":
     parser = Parser()
     args = parser.parser.parse_args()
     Entrypoint(args,parser.parser, None)
+
+
+
+
