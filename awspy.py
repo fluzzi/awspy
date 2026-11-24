@@ -1391,6 +1391,7 @@ class AwsFetcher:
         return sorted(results.values(), key=lambda x: x['total'], reverse=True)
 
     def get_instance_bw(self, instance_id, hours, unit='mbps'):
+        hours = min(720, int(hours))
         # Divisor mapping for formula: (Bytes * 8) / (period * divisor)
         unit_map = {
             'bps': 1,
@@ -1401,7 +1402,7 @@ class AwsFetcher:
         divisor = unit_map.get(unit.lower(), 1000000)
         end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
         start_time = end_time - datetime.timedelta(hours=hours)
-        period = 300 
+        period = 300
 
         try:
             response = self.cw_client.get_metric_data(
@@ -1441,12 +1442,29 @@ class AwsFetcher:
             
             results = {'timestamps': [], 'in': [], 'out': []}
             
+            # Format timestamp containing date if time range is greater than 24 hours
+            ts_format = "%m-%d %H:%M" if hours > 24 else "%H:%M"
+            
             for res in response.get('MetricDataResults', []):
                 if res['Id'] == 'bw_in':
-                    results['timestamps'] = [t.strftime("%H:%M") for t in res['Timestamps']]
+                    results['timestamps'] = [t.strftime(ts_format) for t in res['Timestamps']]
                     results['in'] = res['Values']
                 elif res['Id'] == 'bw_out':
                     results['out'] = res['Values']
+            # Downsample if there are too many points to keep frontend rendering fast (max 300 points)
+            # We use max-pooling over the window to preserve the peak values (peaks won't be smoothed out)
+            step = max(1, len(results['timestamps']) // 300)
+            if step > 1:
+                downsampled = {'timestamps': [], 'in': [], 'out': []}
+                for i in range(0, len(results['timestamps']), step):
+                    window_ts = results['timestamps'][i:i+step]
+                    window_in = results['in'][i:i+step]
+                    window_out = results['out'][i:i+step]
+                    if window_ts:
+                        downsampled['timestamps'].append(window_ts[len(window_ts)//2])
+                        downsampled['in'].append(max(window_in) if window_in else 0.0)
+                        downsampled['out'].append(max(window_out) if window_out else 0.0)
+                results = downsampled
                     
             return results
         except Exception as e:
@@ -1454,10 +1472,12 @@ class AwsFetcher:
 
     def get_instance_pps(self, instance_id, hours):
         """Fetches PPS metrics for a specific instance for graphing."""
+        hours = min(720, int(hours))
         # 1. Setup Time Window (5-min offset for CW consistency)
         end_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
         start_time = end_time - datetime.timedelta(hours=hours)
-        period = 300 
+        
+        period = 300
 
         try:
             # 2. Fetch Metrics using the centralized CW client
@@ -1489,7 +1509,7 @@ class AwsFetcher:
                         }, 
                         'ReturnData': False
                     },
-                    # We use Metric Math to calculate real average PPS over the 300s window
+                    # We use Metric Math to calculate real average PPS over the window
                     {'Id': 'pps_in', 'Expression': f'i / {period}', 'ReturnData': True},
                     {'Id': 'pps_out', 'Expression': f'o / {period}', 'ReturnData': True}
                 ],
@@ -1505,13 +1525,31 @@ class AwsFetcher:
                 'out': []
             }
             
+            # Format timestamp containing date if time range is greater than 24 hours
+            ts_format = "%m-%d %H:%M" if hours > 24 else "%H:%M"
+            
             # Map results to our dictionary
             for res in response.get('MetricDataResults', []):
                 if res['Id'] == 'pps_in':
-                    results['timestamps'] = [t.strftime("%H:%M") for t in res['Timestamps']]
+                    results['timestamps'] = [t.strftime(ts_format) for t in res['Timestamps']]
                     results['in'] = res['Values']
                 elif res['Id'] == 'pps_out':
                     results['out'] = res['Values']
+                    
+            # Downsample if there are too many points to keep frontend rendering fast (max 300 points)
+            # We use max-pooling over the window to preserve the peak values (peaks won't be smoothed out)
+            step = max(1, len(results['timestamps']) // 300)
+            if step > 1:
+                downsampled = {'timestamps': [], 'in': [], 'out': []}
+                for i in range(0, len(results['timestamps']), step):
+                    window_ts = results['timestamps'][i:i+step]
+                    window_in = results['in'][i:i+step]
+                    window_out = results['out'][i:i+step]
+                    if window_ts:
+                        downsampled['timestamps'].append(window_ts[len(window_ts)//2])
+                        downsampled['in'].append(max(window_in) if window_in else 0.0)
+                        downsampled['out'].append(max(window_out) if window_out else 0.0)
+                results = downsampled
                     
             return results
         except Exception as e:
@@ -3024,7 +3062,6 @@ if __name__ == "__main__":
     parser = Parser()
     args = parser.parser.parse_args()
     Entrypoint(args,parser.parser, None)
-
 
 
 
